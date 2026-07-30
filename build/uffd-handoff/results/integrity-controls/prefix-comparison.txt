@@ -1,0 +1,7 @@
+pages_compared=4095
+equal_pages=4095
+zero_pages=4081
+nonzero_pages=14
+first_mismatch=None
+snapshot_sha256=aefef938a3df1e4f7b86d3e4fb28900da72ab9e0a163214575fcba3bce4cf3fe
+delivered_sha256=aefef938a3df1e4f7b86d3e4fb28900da72ab9e0a163214575fcba3bce4cf3fe

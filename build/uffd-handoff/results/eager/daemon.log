@@ -1,0 +1,2 @@
+[2026-07-29T09:31:13Z INFO  offload_daemon] Offload daemon connected to "/home/simonlucido/cloud-hypervisor/build/uffd-bench/eager-restore.sock" (ondemand=false)
+[2026-07-29T09:31:13Z INFO  offload_daemon] Restore replay finished

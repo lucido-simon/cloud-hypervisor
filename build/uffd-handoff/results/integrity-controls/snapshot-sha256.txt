@@ -1,0 +1,3 @@
+1f2fc0afdfaf8f2ff315f50ea106ae70d5f97fdcc6a0a90f780c6022c506f686  /home/simonlucido/cloud-hypervisor/build/uffd-minimal/snapshot/memory-0
+d7748e9b1abdf5f8314bbab01c76f7ab805090beeac0ff745558aa3d9203d5f0  /home/simonlucido/cloud-hypervisor/build/uffd-minimal/snapshot/migration_config.json
+a396a59d7e77690c9711a5afc117efcf5585c93d500808cbbed0f9b633303eb0  /home/simonlucido/cloud-hypervisor/build/uffd-minimal/snapshot/state.json

@@ -1,0 +1,2 @@
+stalled_resume=PASS no reset while daemon stopped for 1 second
+restore_daemon_exit=nonzero

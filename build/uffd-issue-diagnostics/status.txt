@@ -1,0 +1,4 @@
+receiver=0
+shutdown=0
+vmm=0
+daemon=0

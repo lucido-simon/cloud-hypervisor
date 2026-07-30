@@ -1,0 +1,3 @@
+/home/simonlucido/cloud-hypervisor/target/release/cloud-hypervisor -v --api-socket /tmp/ch-issue-api-2478381.sock
+/home/simonlucido/cloud-hypervisor/target/release/ch-remote --api-socket /tmp/ch-issue-api-2478381.sock receive-migration receiver_url=unix:/tmp/ch-issue-restore-2478381.sock\,memory_mode=postcopy
+/home/simonlucido/cloud-hypervisor/target/release/offload_daemon restore --socket /tmp/ch-issue-restore-2478381.sock --input-dir /home/simonlucido/cloud-hypervisor/build/uffd-minimal/snapshot --resume --ondemand

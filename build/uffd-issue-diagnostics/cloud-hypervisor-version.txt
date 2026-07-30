@@ -1,0 +1,2 @@
+cloud-hypervisor v53.0-85-g616bafbe8
+Migration Protocol Versions: 0

@@ -1,0 +1,48 @@
+{
+  "cpus": {
+    "boot_vcpus": 1,
+    "max_vcpus": 1,
+    "kvm_hyperv": false,
+    "max_phys_bits": 46,
+    "features": {
+      "amx": false
+    },
+    "nested": true,
+    "core_scheduling": "Vm",
+    "profile": "Host"
+  },
+  "memory": {
+    "size": 268435456,
+    "mergeable": false,
+    "hotplug_method": "Acpi",
+    "shared": true,
+    "hugepages": false,
+    "prefault": false,
+    "reserve": false,
+    "thp": true
+  },
+  "payload": {
+    "kernel": "/home/simonlucido/workloads/vmlinux-x86_64",
+    "cmdline": "panic=-1",
+    "initramfs": "/home/simonlucido/cloud-hypervisor/build/uffd-minimal-initramfs.cpio"
+  },
+  "rng": {
+    "pci_segment": 0,
+    "src": "/dev/urandom"
+  },
+  "serial": {
+    "mode": "Off"
+  },
+  "console": {
+    "mode": "Off",
+    "pci_segment": 0
+  },
+  "debug_console": {
+    "mode": "Off",
+    "iobase": 233
+  },
+  "pvpanic": false,
+  "iommu": false,
+  "watchdog": false,
+  "landlock_enable": false
+}

@@ -1,0 +1,16 @@
+[2026-07-29T09:38:39Z INFO  offload_daemon] Offload daemon connected to "/home/simonlucido/cloud-hypervisor/build/uffd-bench/restore-01.sock" (ondemand=true)
+[2026-07-29T09:38:39Z INFO  offload_daemon] offload daemon: connected dedicated fault connection, serving 1 slot(s)
+[2026-07-29T09:38:39Z INFO  offload_daemon] PageFault #1: gpa=0x0 len=4096
+[2026-07-29T09:38:39Z INFO  offload_daemon] PageFault #2: gpa=0x1000 len=4096
+[2026-07-29T09:38:39Z INFO  offload_daemon] PageFault #3: gpa=0x2000 len=4096
+[2026-07-29T09:38:39Z INFO  offload_daemon] PageFault #4: gpa=0x3000 len=4096
+[2026-07-29T09:38:39Z INFO  offload_daemon] PageFault #5: gpa=0x4000 len=4096
+[2026-07-29T09:38:39Z INFO  offload_daemon] PageFault #8: gpa=0x7000 len=4096
+[2026-07-29T09:38:39Z INFO  offload_daemon] PageFault #16: gpa=0xf000 len=4096
+[2026-07-29T09:38:39Z INFO  offload_daemon] PageFault #32: gpa=0x1f000 len=4096
+[2026-07-29T09:38:39Z INFO  offload_daemon] PageFault #64: gpa=0x3f000 len=4096
+[2026-07-29T09:38:39Z INFO  offload_daemon] PageFault #128: gpa=0x7e000 len=4096
+[2026-07-29T09:38:39Z INFO  offload_daemon] PageFault #256: gpa=0xfe000 len=4096
+[2026-07-29T09:38:39Z INFO  offload_daemon] Offload daemon: waiting for fault serving to finish
+[2026-07-29T09:38:39Z INFO  offload_daemon] PageFault #512: gpa=0x1f9000 len=4096
+Error: Protocol(MigrateSocket(Os { code: 32, kind: BrokenPipe, message: "Broken pipe" }))
