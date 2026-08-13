@@ -377,10 +377,20 @@ migration process. Via the API or `ch-remote`, you may specify:
 - `connections <amount>`: \
   The number of parallel TCP connections to use for migration.
   Must be between `1` and `128`. Defaults to `1`.
-  Multiple connections are not supported with local UNIX-socket migration.
+  Multiple connections are not supported with UNIX-socket migration.
+  During postcopy with multiple connections, one destination UFFD handler is
+  dedicated to background prefaulting and the others serve demand faults.
+  `128` is a validation ceiling, not a recommended setting. Each postcopy
+  connection consumes source and destination thread/socket resources, and each
+  endpoint may retain a staging buffer as large as the guest's largest backing
+  page. For example, a 1 GiB huge-page configuration can require roughly 1 GiB
+  of staging memory per connection at each endpoint. The destination also keeps
+  one shared byte of tracking state per backing page, independent of the
+  connection count (about 256 MiB per TiB of guest RAM with 4 KiB pages).
 - `memory_mode <precopy|postcopy>`: \
   Memory transfer mode. `postcopy` resumes the destination first and faults
-  guest pages in on demand over a dedicated connection. Defaults to `precopy`.
+  guest pages in on demand over one or more dedicated connections. Defaults to
+  `precopy`.
 - `zone_updates <list of zone updates>`: \
   A list of updates to apply to memory zones on the receiver side. For example,
   this can be used to remap memory zones to another NUMA node. Each zone update

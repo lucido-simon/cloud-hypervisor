@@ -281,10 +281,9 @@ pub enum MigrationMode {
     #[default]
     Precopy,
     /// Resume the destination first and fault guest pages in on demand.
-    /// This is an experimental mode. It uses a single connection even
-    /// when parallel connections are configured. Pages are served on
-    /// demand, but a background faulting mechanism also pulls in the
-    /// remaining pages to speed up completion.
+    /// This is an experimental mode. Pages are served on demand, but a
+    /// background faulting mechanism also pulls in the remaining pages to
+    /// speed up completion.
     Postcopy,
 }
 
@@ -608,7 +607,8 @@ pub struct VmSendMigrationData {
 
     /// The number of parallel TCP connections for migration.
     ///
-    /// Must be between 1 and `MAX_MIGRATION_CONNECTIONS` inclusive.
+    /// If omitted, migration uses one connection. Must be between 1 and
+    /// `MAX_MIGRATION_CONNECTIONS` inclusive.
     #[serde(default = "VmSendMigrationData::default_connections")]
     pub connections: NonZeroU32,
     /// Directory containing the TLS client certificate (`client-cert.pem`),
@@ -643,7 +643,6 @@ impl VmSendMigrationData {
         NonZeroU64::new(Self::DEFAULT_TIMEOUT.as_secs()).unwrap()
     }
 
-    // Use a single connection as default for backward compatibility.
     fn default_connections() -> NonZeroU32 {
         NonZeroU32::new(1).unwrap()
     }
@@ -761,8 +760,7 @@ impl VmSendMigrationData {
         {
             if self.connections.get() > 1 {
                 return Err(VmSendMigrationConfigError::ValidationError(
-                    "UNIX sockets and connections option cannot be used at the same time."
-                        .to_string(),
+                    "Multiple connections are not supported with UNIX sockets.".to_string(),
                 ));
             }
             if self.tls_dir.is_some() {
@@ -791,8 +789,7 @@ impl VmSendMigrationData {
 
             if self.connections.get() > 1 {
                 return Err(VmSendMigrationConfigError::ValidationError(
-                    "local option and connections option cannot be used at the same time."
-                        .to_string(),
+                    "local option does not support multiple connections.".to_string(),
                 ));
             }
         }
@@ -811,19 +808,10 @@ impl VmSendMigrationData {
             })?;
         }
 
-        if matches!(self.memory_mode, MigrationMode::Postcopy) {
-            if self.local {
-                return Err(VmSendMigrationConfigError::ValidationError(
-                    "memory_mode=postcopy and local options are mutually exclusive.".to_string(),
-                ));
-            }
-
-            if self.connections.get() > 1 {
-                return Err(VmSendMigrationConfigError::ValidationError(
-                    "memory_mode=postcopy currently requires a single connection (connections=1)."
-                        .to_string(),
-                ));
-            }
+        if matches!(self.memory_mode, MigrationMode::Postcopy) && self.local {
+            return Err(VmSendMigrationConfigError::ValidationError(
+                "memory_mode=postcopy and local options are mutually exclusive.".to_string(),
+            ));
         }
 
         Ok(())
@@ -2353,6 +2341,15 @@ mod unit_tests {
         assert_eq!(data.timeout_s, VmSendMigrationData::default_timeout_s());
         assert_eq!(data.timeout_strategy, TimeoutStrategy::default());
         assert_eq!(data.connections, VmSendMigrationData::default_connections());
+        assert_eq!(
+            serde_json::to_value(&data).unwrap()["connections"],
+            serde_json::json!(1)
+        );
+        let data: VmSendMigrationData = serde_json::from_value(serde_json::json!({
+            "destination_url": "tcp:192.168.1.1:8080"
+        }))
+        .unwrap();
+        assert_eq!(data.connections, VmSendMigrationData::default_connections());
 
         let data = VmSendMigrationData::parse("destination_url=tcp:[2001:db8::1]:8080")
             .expect("IPv6 migration string should parse");
@@ -2457,21 +2454,43 @@ mod unit_tests {
             }
         );
 
-        // Postcopy happy path (TCP only, single connection).
+        // Postcopy defaults to one connection regardless of VM size.
         let data =
             VmSendMigrationData::parse("destination_url=tcp:192.168.1.1:8080,memory_mode=postcopy")
                 .unwrap();
         assert_eq!(data.memory_mode, MigrationMode::Postcopy);
+        assert_eq!(data.connections.get(), 1);
+
+        // Omitted postcopy connections over UNIX also resolve to one, while an
+        // explicit count greater than one remains unsupported.
+        let data =
+            VmSendMigrationData::parse("destination_url=unix:/tmp/sock,memory_mode=postcopy")
+                .unwrap();
+        assert_eq!(data.connections.get(), 1);
+        let data = VmSendMigrationData::parse(
+            "destination_url=unix:/tmp/sock,memory_mode=postcopy,connections=1",
+        )
+        .unwrap();
+        assert_eq!(data.connections.get(), 1);
+        VmSendMigrationData::parse(
+            "destination_url=unix:/tmp/sock,memory_mode=postcopy,connections=2",
+        )
+        .unwrap_err();
 
         // memory_mode=postcopy + local must be rejected.
         VmSendMigrationData::parse("destination_url=unix:/tmp/sock,local=on,memory_mode=postcopy")
             .unwrap_err();
 
-        // memory_mode=postcopy + multi-connection must be rejected.
-        VmSendMigrationData::parse(
+        // Postcopy accepts multiple fault connections.
+        let data = VmSendMigrationData::parse(
             "destination_url=tcp:192.168.1.1:8080,memory_mode=postcopy,connections=4",
         )
-        .unwrap_err();
+        .unwrap();
+        assert_eq!(data.connections.get(), 4);
+        assert_eq!(
+            serde_json::to_value(&data).unwrap()["connections"],
+            serde_json::json!(4)
+        );
 
         // preserve_source is accepted together with local (offload snapshot).
         let data = VmSendMigrationData::parse(
