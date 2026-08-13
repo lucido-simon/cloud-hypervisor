@@ -6,6 +6,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 #[cfg(feature = "ivshmem")]
 use std::fs;
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::result;
 use std::str::FromStr;
@@ -28,10 +29,12 @@ use virtio_devices::vhost_user::VIRTIO_FS_TAG_LEN;
 use virtio_devices::{RateLimiterConfig, TokenBucketConfig, net, vhost_user};
 
 use crate::landlock::LandlockAccess;
+use crate::migration::transport::MAX_MIGRATION_CONNECTIONS;
 use crate::vm_config::*;
 
 const MAX_NUM_PCI_SEGMENTS: u16 = 96;
 const MAX_IOMMU_ADDRESS_WIDTH_BITS: u8 = 64;
+pub(crate) const DEFAULT_RESTORE_UFFD_HANDLERS: NonZeroU32 = NonZeroU32::new(1).unwrap();
 
 // Maximum queue size is largest power of 2 that fits into a u16
 const VIRTIO_MAX_QUEUE_SIZE: u16 = 32768;
@@ -418,6 +421,12 @@ pub enum ValidationError {
     /// Prefault requires the eager-copy restore mode
     #[error("'prefault' requires 'memory_restore_mode=copy'")]
     InvalidRestorePrefaultWithOnDemand,
+    /// UFFD handlers only apply to on-demand restore.
+    #[error("UFFD handlers require 'memory_restore_mode=ondemand'")]
+    InvalidRestoreUffdHandlersWithoutOnDemand,
+    /// Too many UFFD handlers were requested for restore.
+    #[error("Too many UFFD handlers: specified {0} but {MAX_MIGRATION_CONNECTIONS} is the limit")]
+    TooManyRestoreUffdHandlers(u32),
     /// Path provided in landlock-rules doesn't exist
     #[error("Path {0:?} provided in landlock-rules does not exist")]
     LandlockPathDoesNotExist(PathBuf),
@@ -2892,6 +2901,8 @@ pub struct RestoreConfig {
     pub prefault: bool,
     #[serde(default)]
     pub memory_restore_mode: MemoryRestoreMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uffd_handlers: Option<NonZeroU32>,
     #[serde(default)]
     pub net_fds: Option<Vec<RestoredNetConfig>>,
     #[serde(default)]
@@ -2907,13 +2918,14 @@ pub struct RestoreConfig {
 
 impl RestoreConfig {
     pub const SYNTAX: &'static str = "Restore from a VM snapshot. \
-        \nRestore parameters \"source_url=<source_url>,prefault=on|off,memory_restore_mode=copy|ondemand|copyonwrite,\
+        \nRestore parameters \"source_url=<source_url>,prefault=on|off,memory_restore_mode=copy|ondemand|copyonwrite,uffd_handlers=<amount>,\
         net_fds=<list_of_net_ids_with_their_associated_fds>,\
         vfio_fds=<list_of_vfio_ids_with_their_associated_fd>,iommufd_fd=<fd>,resume=true|false,\
         zone_updates=<list_of_updates>\"
         \n`source_url` should be a valid URL (e.g file:///foo/bar or tcp://192.168.1.10/foo) \
         \n`prefault` controls eager prefaulting for the copy-based restore path (disabled by default) \
         \n`memory_restore_mode=copy` preserves the existing eager read-copy restore behavior, `memory_restore_mode=ondemand` enables lazy demand paging and fails restore if userfaultfd support is unavailable, and `memory_restore_mode=copyonwrite` maps the snapshot file copy-on-write (plain private RAM only; falls back to copy otherwise) \
+        \n`uffd_handlers` controls the total number of handlers for file-based on-demand restore (defaults to 1, maximum 128); it is only valid with `memory_restore_mode=ondemand`, and with multiple handlers, one is dedicated to background prefaulting \
         \n`net_fds` is a list of net ids with new file descriptors. \
         Only net devices backed by FDs directly are needed as input.\
         \n`vfio_fds` is a list of VFIO device ids each paired with a new cdev file descriptor, \
@@ -2930,6 +2942,7 @@ impl RestoreConfig {
             .add("source_url")
             .add("prefault")
             .add("memory_restore_mode")
+            .add("uffd_handlers")
             .add("net_fds")
             .add("vfio_fds")
             .add("iommufd_fd")
@@ -2950,6 +2963,17 @@ impl RestoreConfig {
             .convert::<MemoryRestoreMode>("memory_restore_mode")
             .map_err(Error::ParseRestore)?
             .unwrap_or_default();
+        let uffd_handlers = parser
+            .convert::<u32>("uffd_handlers")
+            .map_err(Error::ParseRestore)?
+            .map(|handlers| {
+                NonZeroU32::new(handlers).ok_or_else(|| {
+                    Error::ParseRestore(OptionParserError::InvalidValue(
+                        "uffd_handlers must be non-zero".to_string(),
+                    ))
+                })
+            })
+            .transpose()?;
         let net_fds = parser
             .convert::<TupleList<String, Vec<u64>>>("net_fds")
             .map_err(Error::ParseRestore)?
@@ -2998,6 +3022,7 @@ impl RestoreConfig {
             source_url,
             prefault,
             memory_restore_mode,
+            uffd_handlers,
             net_fds,
             vfio_fds,
             iommufd_fd,
@@ -3012,6 +3037,16 @@ impl RestoreConfig {
     pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
         if self.memory_restore_mode != MemoryRestoreMode::Copy && self.prefault {
             return Err(ValidationError::InvalidRestorePrefaultWithOnDemand);
+        }
+
+        if self.uffd_handlers.is_some() && self.memory_restore_mode != MemoryRestoreMode::OnDemand {
+            return Err(ValidationError::InvalidRestoreUffdHandlersWithoutOnDemand);
+        }
+
+        if let Some(handlers) = self.uffd_handlers
+            && handlers.get() > MAX_MIGRATION_CONNECTIONS
+        {
+            return Err(ValidationError::TooManyRestoreUffdHandlers(handlers.get()));
         }
 
         let mut restored_net_with_fds = HashMap::new();
@@ -5312,6 +5347,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 source_url: PathBuf::from("/path/to/snapshot"),
                 prefault: false,
                 memory_restore_mode: MemoryRestoreMode::Copy,
+                uffd_handlers: None,
                 net_fds: None,
                 vfio_fds: None,
                 iommufd_fd: None,
@@ -5327,6 +5363,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 source_url: PathBuf::from("/path/to/snapshot"),
                 prefault: false,
                 memory_restore_mode: MemoryRestoreMode::Copy,
+                uffd_handlers: None,
                 net_fds: Some(vec![
                     RestoredNetConfig {
                         id: "net0".to_string(),
@@ -5351,6 +5388,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 source_url: PathBuf::from("/path/to/snapshot"),
                 prefault: false,
                 memory_restore_mode: MemoryRestoreMode::OnDemand,
+                uffd_handlers: None,
                 net_fds: None,
                 vfio_fds: None,
                 iommufd_fd: None,
@@ -5359,11 +5397,26 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             }
         );
         assert_eq!(
+            RestoreConfig::parse("source_url=/path/to/snapshot,memory_restore_mode=ondemand")?
+                .uffd_handlers
+                .unwrap_or(DEFAULT_RESTORE_UFFD_HANDLERS)
+                .get(),
+            1
+        );
+        assert_eq!(
+            RestoreConfig::parse(
+                "source_url=/path/to/snapshot,memory_restore_mode=ondemand,uffd_handlers=8"
+            )?
+            .uffd_handlers,
+            NonZeroU32::new(8)
+        );
+        assert_eq!(
             RestoreConfig::parse("source_url=/path/to/snapshot,resume=on,zone_updates=[zone1@1]")?,
             RestoreConfig {
                 source_url: PathBuf::from("/path/to/snapshot"),
                 prefault: false,
                 memory_restore_mode: MemoryRestoreMode::Copy,
+                uffd_handlers: None,
                 net_fds: None,
                 vfio_fds: None,
                 iommufd_fd: None,
@@ -5382,6 +5435,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 source_url: PathBuf::from("/path/to/snapshot"),
                 prefault: false,
                 memory_restore_mode: MemoryRestoreMode::Copy,
+                uffd_handlers: None,
                 net_fds: None,
                 vfio_fds: Some(vec![
                     RestoredVfioConfig {
@@ -5406,6 +5460,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 source_url: PathBuf::from("/path/to/snapshot"),
                 prefault: false,
                 memory_restore_mode: MemoryRestoreMode::Copy,
+                uffd_handlers: None,
                 net_fds: None,
                 vfio_fds: Some(vec![
                     RestoredVfioConfig {
@@ -5425,6 +5480,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         // Parsing should fail as source_url is a required field
         RestoreConfig::parse("prefault=off").unwrap_err();
         RestoreConfig::parse("source_url=/path/to/snapshot,memory_restore_mode=bogus").unwrap_err();
+        RestoreConfig::parse("source_url=/path/to/snapshot,uffd_handlers=0").unwrap_err();
         RestoreConfig::parse("source_url=/path/to/snapshot,resume=on,zone_updates=[@1]")
             .unwrap_err();
         RestoreConfig::parse("source_url=/path/to/snapshot,resume=on,zone_updates=[@]")
@@ -5442,11 +5498,22 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
 
     #[test]
     fn test_restore_config_serde() {
+        let default_config =
+            serde_json::from_str::<RestoreConfig>(r#"{"source_url":"/path/to/snapshot"}"#).unwrap();
+        assert_eq!(default_config.memory_restore_mode, MemoryRestoreMode::Copy);
+        assert_eq!(default_config.uffd_handlers, None);
         assert_eq!(
-            serde_json::from_str::<RestoreConfig>(r#"{"source_url":"/path/to/snapshot"}"#)
+            default_config
+                .uffd_handlers
+                .unwrap_or(DEFAULT_RESTORE_UFFD_HANDLERS)
+                .get(),
+            1
+        );
+        assert!(
+            serde_json::to_value(&default_config)
                 .unwrap()
-                .memory_restore_mode,
-            MemoryRestoreMode::Copy
+                .get("uffd_handlers")
+                .is_none()
         );
         assert_eq!(
             serde_json::from_str::<RestoreConfig>(
@@ -5456,6 +5523,18 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             .memory_restore_mode,
             MemoryRestoreMode::OnDemand
         );
+        assert_eq!(
+            serde_json::from_str::<RestoreConfig>(
+                r#"{"source_url":"/path/to/snapshot","memory_restore_mode":"OnDemand","uffd_handlers":8}"#
+            )
+            .unwrap()
+            .uffd_handlers,
+            NonZeroU32::new(8)
+        );
+        serde_json::from_str::<RestoreConfig>(
+            r#"{"source_url":"/path/to/snapshot","uffd_handlers":0}"#,
+        )
+        .unwrap_err();
         assert_eq!(
             serde_json::from_str::<RestoreConfig>(
                 r#"{"source_url":"/path/to/snapshot","zone_updates":[{"id": "zone1", "host_numa_node": 1}]}"#
@@ -5542,6 +5621,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             source_url: PathBuf::from("/path/to/snapshot"),
             prefault: false,
             memory_restore_mode: MemoryRestoreMode::Copy,
+            uffd_handlers: None,
             net_fds: Some(vec![
                 RestoredNetConfig {
                     id: "net0".to_string(),
@@ -5560,6 +5640,27 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             zone_updates: vec![],
         };
         valid_config.validate(&snapshot_vm_config).unwrap();
+
+        let handlers_without_on_demand = RestoreConfig {
+            uffd_handlers: NonZeroU32::new(1),
+            ..valid_config.clone()
+        };
+        assert_eq!(
+            handlers_without_on_demand.validate(&snapshot_vm_config),
+            Err(ValidationError::InvalidRestoreUffdHandlersWithoutOnDemand)
+        );
+
+        let too_many_handlers = RestoreConfig {
+            memory_restore_mode: MemoryRestoreMode::OnDemand,
+            uffd_handlers: NonZeroU32::new(MAX_MIGRATION_CONNECTIONS + 1),
+            ..valid_config.clone()
+        };
+        assert_eq!(
+            too_many_handlers.validate(&snapshot_vm_config),
+            Err(ValidationError::TooManyRestoreUffdHandlers(
+                MAX_MIGRATION_CONNECTIONS + 1
+            ))
+        );
 
         let mut invalid_config = valid_config.clone();
         invalid_config.net_fds = Some(vec![RestoredNetConfig {
@@ -5621,6 +5722,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             source_url: PathBuf::from("/path/to/snapshot"),
             prefault: false,
             memory_restore_mode: MemoryRestoreMode::Copy,
+            uffd_handlers: None,
             net_fds: None,
             vfio_fds: None,
             iommufd_fd: None,
@@ -5641,6 +5743,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             source_url: PathBuf::from("/path/to/snapshot"),
             prefault: true,
             memory_restore_mode: MemoryRestoreMode::OnDemand,
+            uffd_handlers: None,
             net_fds: None,
             vfio_fds: None,
             iommufd_fd: None,
@@ -5684,6 +5787,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             source_url: PathBuf::from("/path/to/snapshot"),
             prefault: true,
             memory_restore_mode: MemoryRestoreMode::CopyOnWrite,
+            uffd_handlers: None,
             net_fds: None,
             vfio_fds: None,
             iommufd_fd: None,
@@ -5755,6 +5859,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             source_url: PathBuf::from("/path/to/snapshot"),
             prefault: false,
             memory_restore_mode: MemoryRestoreMode::Copy,
+            uffd_handlers: None,
             net_fds: None,
             vfio_fds: Some(vec![RestoredVfioConfig {
                 id: "vfio0".to_string(),
