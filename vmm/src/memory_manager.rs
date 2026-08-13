@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Seek, SeekFrom};
 use std::mem::{MaybeUninit, zeroed};
+use std::num::NonZeroU32;
 use std::ops::{BitAnd, Not, Sub};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
@@ -1098,13 +1099,19 @@ impl MemoryManager {
         &mut self,
         file_path: &Path,
         saved_regions: &MemoryRangeTable,
+        uffd_handlers: NonZeroU32,
         exit_evt: &EventFd,
     ) -> Result<(), Error> {
         let mut file_offset: u64 = 0;
 
-        let snapshot_file = File::open(file_path).map_err(Error::SnapshotOpen)?;
-        let source: Box<dyn UffdMemorySource> = Box::new(FileUffdMemorySource::new(snapshot_file));
-        let sources = vec![(source, None)];
+        let sources: Vec<(Box<dyn UffdMemorySource>, Option<OwnedFd>)> = (0..uffd_handlers.get())
+            .map(|_| {
+                let snapshot_file = File::open(file_path).map_err(Error::SnapshotOpen)?;
+                let source: Box<dyn UffdMemorySource> =
+                    Box::new(FileUffdMemorySource::new(snapshot_file));
+                Ok((source, None))
+            })
+            .collect::<Result<_, Error>>()?;
 
         let Some((uffd_fd, ranges)) = self.prepare_uffd(
             saved_regions,
@@ -2478,6 +2485,7 @@ impl MemoryManager {
         source_url: Option<&str>,
         prefault: bool,
         memory_restore_mode: MemoryRestoreMode,
+        uffd_handlers: NonZeroU32,
         phys_bits: u8,
         exit_evt: &EventFd,
     ) -> Result<Arc<Mutex<MemoryManager>>, Error> {
@@ -2503,6 +2511,7 @@ impl MemoryManager {
                 mm.lock().unwrap().restore_by_uffd(
                     &memory_file_path,
                     &mem_snapshot.memory_ranges,
+                    uffd_handlers,
                     exit_evt,
                 )?;
             } else {

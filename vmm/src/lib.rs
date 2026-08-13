@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Write, stdout};
+use std::num::NonZeroU32;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::panic::AssertUnwindSafe;
 #[cfg(feature = "guest_debug")]
@@ -51,7 +52,10 @@ use crate::api::{
     ApiRequest, ApiResponse, MigrationMode, RequestHandler, TimeoutStrategy, VmInfoResponse,
     VmReceiveMigrationData, VmSendMigrationData, VmmPingResponse,
 };
-use crate::config::{MemoryRestoreMode, RestoreConfig, VmMemoryZoneUpdateData, add_to_config};
+use crate::config::{
+    DEFAULT_RESTORE_UFFD_HANDLERS, MemoryRestoreMode, RestoreConfig, VmMemoryZoneUpdateData,
+    add_to_config,
+};
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use crate::coredump::GuestDebuggable;
 use crate::device_manager::DeviceManager;
@@ -1954,6 +1958,7 @@ impl Vmm {
         vm_config: Arc<Mutex<VmConfig>>,
         prefault: bool,
         memory_restore_mode: MemoryRestoreMode,
+        uffd_handlers: NonZeroU32,
     ) -> result::Result<(), VmError> {
         match &self.vm {
             VmOwnership::Owned(_) => Err(VmError::VmAlreadyCreated),
@@ -2006,6 +2011,7 @@ impl Vmm {
                     Some(source_url),
                     Some(prefault),
                     Some(memory_restore_mode),
+                    Some(uffd_handlers),
                 )?;
 
                 if self
@@ -2419,6 +2425,7 @@ impl RequestHandler for Vmm {
                             None,
                             None,
                             None,
+                            None,
                         )?;
 
                         let r = vm.boot();
@@ -2489,6 +2496,9 @@ impl RequestHandler for Vmm {
                 }
                 // Safe to unwrap as we checked it was Some(&str).
                 let source_url = source_url.unwrap();
+                let uffd_handlers = restore_cfg
+                    .uffd_handlers
+                    .unwrap_or(DEFAULT_RESTORE_UFFD_HANDLERS);
 
                 let vm_config = Arc::new(Mutex::new(
                     recv_vm_config(source_url).map_err(VmError::Restore)?,
@@ -2549,6 +2559,7 @@ impl RequestHandler for Vmm {
                     vm_config,
                     restore_cfg.prefault,
                     restore_cfg.memory_restore_mode,
+                    uffd_handlers,
                 )
                 .and_then(|()| {
                     if restore_cfg.resume {
@@ -2651,6 +2662,7 @@ impl RequestHandler for Vmm {
             self.console_info.clone(),
             self.console_resize_pipe.clone(),
             Arc::clone(&self.original_termios_opt),
+            None,
             None,
             None,
             None,
