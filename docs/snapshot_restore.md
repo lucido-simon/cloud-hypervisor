@@ -122,6 +122,21 @@ guest RAM before restore completes. This mode is strict: if Cloud Hypervisor
 cannot enable the `userfaultfd` restore path, restore fails instead of falling
 back to `copy`.
 
+The optional `uffd_handlers` parameter selects the total number of UFFD
+handlers, from `1` through `128`, and defaults to `1`. With one handler, the
+same thread serves demand faults and prefaults remaining pages when idle. With
+multiple handlers, one is dedicated to background prefaulting and the others
+serve demand faults. For example, `uffd_handlers=2` creates one demand handler
+and one dedicated prefaulter. `uffd_handlers` is rejected unless
+`memory_restore_mode=ondemand` is selected.
+
+`128` is a validation ceiling, not a recommended setting. Each handler consumes
+thread and file-descriptor resources and may retain a staging buffer as large as
+the guest's largest backing page. For example, a 1 GiB huge-page configuration
+can require roughly 1 GiB of staging memory per handler. The destination also
+keeps one shared byte of tracking state per backing page, independent of the
+handler count (about 256 MiB per TiB of guest RAM with 4 KiB pages).
+
 Current constraints for `memory_restore_mode=ondemand`:
 
 - `prefault=on` is not supported
