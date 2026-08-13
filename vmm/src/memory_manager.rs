@@ -1104,30 +1104,42 @@ impl MemoryManager {
         &mut self,
         saved_regions: &MemoryRangeTable,
         shared_backing: bool,
-        socket: SocketStream,
+        sockets: Vec<SocketStream>,
         exit_evt: &EventFd,
     ) -> Result<(), Error> {
         // Make every fault a small request/response round-trip.
-        socket.set_nodelay(true).map_err(UffdError::SetSocket)?;
-        let socket_owned = socket
-            .as_fd()
-            .try_clone_to_owned()
+        sockets
+            .iter()
+            .try_for_each(|socket| socket.set_nodelay(true))
             .map_err(UffdError::SetSocket)?;
-        let source: Box<dyn UffdMemorySource> =
-            Box::new(SocketUffdMemorySource::new(socket, shared_backing));
-        let sources = vec![(source, Some(socket_owned))];
+
+        let sockets = sockets
+            .into_iter()
+            .map(|socket| {
+                socket.set_nodelay(true).map_err(UffdError::SetSocket)?;
+                let socket_owned = socket
+                    .as_fd()
+                    .try_clone_to_owned()
+                    .map_err(UffdError::SetSocket);
+
+                let source: Box<dyn UffdMemorySource> =
+                    Box::new(SocketUffdMemorySource::new(socket, shared_backing));
+
+                socket_owned.map(|socket| (source, Some(socket)))
+            })
+            .collect::<Result<Vec<(Box<dyn UffdMemorySource>, Option<OwnedFd>)>, _>>()?;
 
         // PageFault uses the GPA as the page identifier on the wire.
         let Some((uffd_fd, ranges)) = self.prepare_uffd(
             saved_regions,
             |r| r.gpa,
-            sources[0].0.requires_uffd_minor_mode(),
+            sockets[0].0.requires_uffd_minor_mode(),
         )?
         else {
             return Ok(());
         };
 
-        self.spawn_uffd_handlers(uffd_fd, sources, ranges, exit_evt)
+        self.spawn_uffd_handlers(uffd_fd, sockets, ranges, exit_evt)
     }
 
     /// Create a UFFD fd and register every range.

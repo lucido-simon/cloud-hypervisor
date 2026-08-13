@@ -338,6 +338,17 @@ call is the same as for a regular restore:
     --resume --ondemand
 ```
 
+On-demand restore uses one fault connection by default. The daemon's
+`--connections` option can explicitly select between `1` and `128` total fault
+connections. With multiple connections, one destination UFFD handler is
+dedicated to background prefaulting and the others serve demand faults. The
+option is only valid together with `--ondemand`.
+
+The same connection limit is a validation ceiling rather than a recommended
+setting. Each connection consumes daemon and destination thread/socket
+resources, and each daemon worker may retain a staging buffer as large as the
+guest's largest backing page.
+
 ### The daemon protocol
 
 The daemon implements the local live-migration wire protocol defined in

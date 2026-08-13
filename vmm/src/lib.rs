@@ -628,6 +628,8 @@ pub struct VmMigrationConfig {
     /// behavior (e.g., serving page faults for postcopy).
     #[serde(default)]
     memory_mode: MigrationMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    postcopy_connections: Option<NonZeroU32>,
 }
 
 impl VmMigrationConfig {
@@ -645,6 +647,33 @@ impl VmMigrationConfig {
     pub fn set_memory_mode(&mut self, memory_mode: MigrationMode) {
         self.memory_mode = memory_mode;
     }
+
+    pub fn set_postcopy_connections(&mut self, connections: NonZeroU32) {
+        self.postcopy_connections = Some(connections);
+    }
+}
+
+fn resolve_received_postcopy_connections(
+    advertised_connections: Option<NonZeroU32>,
+    memory_mode: MigrationMode,
+) -> result::Result<NonZeroU32, MigratableError> {
+    if advertised_connections
+        .is_some_and(|connections| connections.get() > transport::MAX_MIGRATION_CONNECTIONS)
+    {
+        return Err(MigratableError::MigrateReceive(anyhow!(
+            "Postcopy connections must not exceed {}",
+            transport::MAX_MIGRATION_CONNECTIONS
+        )));
+    }
+
+    if advertised_connections.is_some() && !matches!(memory_mode, MigrationMode::Postcopy) {
+        return Err(MigratableError::MigrateReceive(anyhow!(
+            "Postcopy fault connections require memory_mode=postcopy"
+        )));
+    }
+
+    // Senders predating postcopy_connections open one fault connection.
+    Ok(advertised_connections.unwrap_or(NonZeroU32::new(1).unwrap()))
 }
 
 #[derive(Debug, Clone)]
@@ -748,6 +777,7 @@ struct ReceiveMigrationConfiguredData {
     /// The memory transfer mode announced by the sender in the received
     /// [`VmMigrationConfig`].
     memory_mode: MigrationMode,
+    postcopy_connections: NonZeroU32,
 }
 
 /// The receiver's state machine behind the migration protocol.
@@ -1012,7 +1042,7 @@ impl Vmm {
              memory_files: HashMap<u32, File>|
              -> result::Result<ReceiveMigrationConfiguredData, MigratableError> {
                 let shared_backing = !memory_files.is_empty();
-                let (memory_manager, memory_mode) =
+                let (memory_manager, memory_mode, postcopy_connections) =
                     self.vm_receive_config(req, socket, memory_files, receive_data_migration)?;
                 let guest_memory = memory_manager.lock().unwrap().guest_memory();
                 // Create the additional-connection receiver even in the single-connection case.
@@ -1036,6 +1066,7 @@ impl Vmm {
                     shared_backing,
                     fault_rx,
                     memory_mode,
+                    postcopy_connections,
                 })
             };
 
@@ -1145,15 +1176,21 @@ impl Vmm {
         // Serve faults before restore so accesses during restore resolve on demand.
         if matches!(config_data.memory_mode, MigrationMode::Postcopy) {
             let shared_backing = config_data.shared_backing;
-            let fault_stream = config_data
-                .fault_rx
-                .recv_timeout(FAULT_CONNECTION_ACCEPT_TIMEOUT)
-                .map_err(|e| {
-                    config_data.connections.cleanup().ok();
-                    MigratableError::MigrateReceive(anyhow!(
-                        "Timed out waiting for postcopy fault connection: {e}"
-                    ))
-                })?;
+            let mut fault_stream =
+                Vec::with_capacity(config_data.postcopy_connections.get() as usize);
+            for _ in 0..config_data.postcopy_connections.get() {
+                fault_stream.push(
+                    config_data
+                        .fault_rx
+                        .recv_timeout(FAULT_CONNECTION_ACCEPT_TIMEOUT)
+                        .map_err(|e| {
+                            config_data.connections.cleanup().ok();
+                            MigratableError::MigrateReceive(anyhow!(
+                                "Timed out waiting for postcopy fault connection: {e}"
+                            ))
+                        })?,
+                );
+            }
             let mm = config_data.memory_manager.clone();
             let saved_regions = mm
                 .lock()
@@ -1195,7 +1232,7 @@ impl Vmm {
         socket: &mut T,
         existing_memory_files: HashMap<u32, File>,
         receive_data_migration: &VmReceiveMigrationData,
-    ) -> result::Result<(Arc<Mutex<MemoryManager>>, MigrationMode), MigratableError>
+    ) -> result::Result<(Arc<Mutex<MemoryManager>>, MigrationMode, NonZeroU32), MigratableError>
     where
         T: Read,
     {
@@ -1213,6 +1250,8 @@ impl Vmm {
             .map_err(MigratableError::MigrateReceive)?;
 
         let mode = vm_migration_config.memory_mode();
+        let postcopy_connections =
+            resolve_received_postcopy_connections(vm_migration_config.postcopy_connections, mode)?;
 
         // Mirrors the vm_restore handling of RestoreConfig.vfio_fds. The
         // received VmConfig carries the source's device paths or stale FDs,
@@ -1305,7 +1344,7 @@ impl Vmm {
         .context("Error creating MemoryManager from snapshot")
         .map_err(MigratableError::MigrateReceive)?;
 
-        Ok((memory_manager, mode))
+        Ok((memory_manager, mode, postcopy_connections))
     }
 
     /// Receives the final VM state (devices, vCPUs) and restores the VM.
@@ -1635,6 +1674,11 @@ impl Vmm {
 
         // Send config
         let vm_config = vm.get_config();
+        let migration_connections = send_data_migration.connections;
+        debug!(
+            "Using {} migration connection(s)",
+            migration_connections.get()
+        );
         #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
         let common_cpuid = {
             #[cfg(feature = "tdx")]
@@ -1691,6 +1735,11 @@ impl Vmm {
             common_cpuid,
             memory_manager_data: vm.memory_manager_data(),
             memory_mode: send_data_migration.memory_mode,
+            postcopy_connections: matches!(
+                send_data_migration.memory_mode,
+                MigrationMode::Postcopy
+            )
+            .then_some(migration_connections),
         };
         transport::send_config(&mut socket, &vm_migration_config)?;
 
@@ -1717,7 +1766,7 @@ impl Vmm {
         } else {
             let mut mem_send = transport::SendAdditionalConnections::new(
                 &send_data_migration.destination_url,
-                send_data_migration.connections,
+                migration_connections,
                 send_data_migration.tls_dir.as_deref(),
                 &vm.guest_memory(),
                 &seccomp_filters.tcp_worker,
@@ -1750,27 +1799,38 @@ impl Vmm {
 
         // For postcopy, serve faults before sending State so the destination
         // can fault pages in during restore.
-        let postcopy_handle = if matches!(send_data_migration.memory_mode, MigrationMode::Postcopy)
+        let postcopy_handles = if matches!(send_data_migration.memory_mode, MigrationMode::Postcopy)
         {
-            let fault_stream = transport::open_fault_connection(
-                &send_data_migration.destination_url,
-                send_data_migration.tls_dir.as_deref(),
-            )?;
-            let guest_memory = vm.guest_memory();
-
-            let seccomp_filters_clone = seccomp_filters.clone();
-            let handle = thread::Builder::new()
-                .name("migrate-send-postcopy".to_owned())
-                .spawn(move || {
-                    Self::serve_postcopy(
-                        &seccomp_filters_clone.postcopy_server,
-                        fault_stream,
-                        guest_memory,
+            let fault_streams = (0..migration_connections.get())
+                .map(|_| {
+                    transport::open_fault_connection(
+                        &send_data_migration.destination_url,
+                        send_data_migration.tls_dir.as_deref(),
                     )
                 })
-                .context("spawning postcopy serve thread")
-                .map_err(MigratableError::MigrateSend)?;
-            Some(handle)
+                .collect::<result::Result<Vec<_>, _>>()?;
+            let guest_memory = vm.guest_memory();
+
+            let handles = fault_streams
+                .into_iter()
+                .enumerate()
+                .map(|(index, fault_stream)| {
+                    let seccomp_filters = seccomp_filters.clone();
+                    let guest_memory = guest_memory.clone();
+                    thread::Builder::new()
+                        .name(format!("uffd-send-{index}"))
+                        .spawn(move || {
+                            Self::serve_postcopy(
+                                &seccomp_filters.postcopy_server,
+                                fault_stream,
+                                guest_memory,
+                            )
+                        })
+                        .with_context(|| format!("spawning postcopy serve thread {index}"))
+                        .map_err(MigratableError::MigrateSend)
+                })
+                .collect::<result::Result<Vec<_>, _>>()?;
+            Some(handles)
         } else {
             None
         };
@@ -1828,11 +1888,24 @@ impl Vmm {
             vm.stop_dirty_log()?;
         }
 
-        // Wait for the serve thread to drain every page
-        if let Some(handle) = postcopy_handle {
-            handle.join().map_err(|e| {
-                MigratableError::MigrateSend(anyhow!("postcopy serve thread panicked: {e:?}"))
-            })??;
+        // Wait for the serve threads to drain every page.
+        if let Some(handles) = postcopy_handles {
+            let mut first_error = None;
+            for (index, handle) in handles.into_iter().enumerate() {
+                let result = handle.join().map_err(|e| {
+                    MigratableError::MigrateSend(anyhow!(
+                        "postcopy serve thread {index} panicked: {e:?}"
+                    ))
+                });
+                if let Err(e) = result.and_then(|result| result)
+                    && first_error.is_none()
+                {
+                    first_error = Some(e);
+                }
+            }
+            if let Some(e) = first_error {
+                return Err(e);
+            }
             // Signal that postcopy has drained every page to the destination.
             event!("vm", "postcopy-migration-completed");
         }
@@ -3498,6 +3571,47 @@ mod tests {
         CpusConfig, DeviceConfig, HotplugMethod, MemoryConfig, MemoryZoneConfig, PayloadConfig,
         PciDeviceCommonConfig, PlatformConfig, RngConfig, SerialConfig,
     };
+
+    #[test]
+    fn test_resolve_received_postcopy_connections() {
+        let one = NonZeroU32::new(1).unwrap();
+        let four = NonZeroU32::new(4).unwrap();
+
+        assert_eq!(
+            resolve_received_postcopy_connections(None, MigrationMode::Precopy).unwrap(),
+            one
+        );
+        assert_eq!(
+            resolve_received_postcopy_connections(None, MigrationMode::Postcopy).unwrap(),
+            one
+        );
+        assert_eq!(
+            resolve_received_postcopy_connections(Some(four), MigrationMode::Postcopy).unwrap(),
+            four
+        );
+
+        let error =
+            resolve_received_postcopy_connections(Some(four), MigrationMode::Precopy).unwrap_err();
+        assert!(matches!(
+            error,
+            MigratableError::MigrateReceive(source)
+                if source.to_string()
+                    == "Postcopy fault connections require memory_mode=postcopy"
+        ));
+
+        let too_many = NonZeroU32::new(transport::MAX_MIGRATION_CONNECTIONS + 1).unwrap();
+        let error = resolve_received_postcopy_connections(Some(too_many), MigrationMode::Postcopy)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            MigratableError::MigrateReceive(source)
+                if source.to_string()
+                    == format!(
+                        "Postcopy connections must not exceed {}",
+                        transport::MAX_MIGRATION_CONNECTIONS
+                    )
+        ));
+    }
 
     fn create_dummy_vmm() -> Vmm {
         Vmm::new(

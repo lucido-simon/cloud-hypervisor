@@ -14,16 +14,17 @@
 //!
 //! Restore (daemon sends): replays those files back to CH. `--resume` resumes
 //! the VM, and `--ondemand` serves pages on demand over the postcopy fault
-//! connection instead of preloading them.
+//! connections instead of preloading them.
 
 use std::ffi::{CString, NulError};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::num::NonZeroU32;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::FileExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 use std::{result, thread};
 
 use clap::{Parser, Subcommand};
@@ -44,6 +45,8 @@ use vmm_sys_util::errno;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
 const MIGRATION_CONFIG_FILENAME: &str = "migration_config.json";
+const DEFAULT_FAULT_CONNECTIONS: NonZeroU32 = NonZeroU32::new(1).unwrap();
+const MAX_FAULT_CONNECTIONS: u32 = 128;
 
 #[derive(Debug, Error)]
 enum Error {
@@ -154,7 +157,22 @@ enum Mode {
         /// On demand paging.
         #[arg(long)]
         ondemand: bool,
+        /// Number of fault connections used for on-demand paging. Defaults to one.
+        #[arg(long, requires = "ondemand", value_parser = parse_fault_connections)]
+        connections: Option<NonZeroU32>,
     },
+}
+
+fn parse_fault_connections(value: &str) -> result::Result<NonZeroU32, String> {
+    let connections = value
+        .parse::<NonZeroU32>()
+        .map_err(|_| format!("connections must be between 1 and {MAX_FAULT_CONNECTIONS}"))?;
+    if connections.get() > MAX_FAULT_CONNECTIONS {
+        return Err(format!(
+            "connections must be between 1 and {MAX_FAULT_CONNECTIONS}"
+        ));
+    }
+    Ok(connections)
 }
 
 fn main() -> Result<()> {
@@ -168,7 +186,14 @@ fn main() -> Result<()> {
             input_dir,
             resume,
             ondemand,
-        } => run_restore(&socket, &input_dir, resume, ondemand),
+            connections,
+        } => run_restore(
+            &socket,
+            &input_dir,
+            resume,
+            ondemand,
+            connections.unwrap_or(DEFAULT_FAULT_CONNECTIONS),
+        ),
     }
 }
 
@@ -395,7 +420,13 @@ fn parse_guest_ram_mappings(value: &serde_json::Value) -> Result<Vec<(u32, u64, 
 }
 
 // Restore mode (migration sender).
-fn run_restore(socket_path: &Path, input_dir: &Path, resume: bool, ondemand: bool) -> Result<()> {
+fn run_restore(
+    socket_path: &Path,
+    input_dir: &Path,
+    resume: bool,
+    ondemand: bool,
+    connections: NonZeroU32,
+) -> Result<()> {
     let migration_config_bytes =
         fs::read(input_dir.join(MIGRATION_CONFIG_FILENAME)).map_err(Error::ReadFile)?;
     let mut migration_config: VmMigrationConfig = serde_json::from_slice(&migration_config_bytes)?;
@@ -407,6 +438,9 @@ fn run_restore(socket_path: &Path, input_dir: &Path, resume: bool, ondemand: boo
         // Ignored
         MigrationMode::default()
     });
+    if ondemand {
+        migration_config.set_postcopy_connections(connections);
+    }
     let migration_config_bytes = serde_json::to_vec(&migration_config)?;
 
     let mut stream = UnixStream::connect(socket_path).map_err(Error::Connect)?;
@@ -450,26 +484,62 @@ fn run_restore(socket_path: &Path, input_dir: &Path, resume: bool, ondemand: boo
         "Config",
     )?;
 
-    // For on demand (postcopy) restore the fault connection must be serving before
-    // CH processes State, so connect it here and serve on its own thread.
-    let serve_handle = if ondemand {
+    // For on demand (postcopy) restore the fault connections must be serving
+    // before CH processes State, so connect them here and serve each one on
+    // its own thread.
+    let serve_handles = if ondemand {
         let slots = Arc::new(ondemand_slots);
-        let mut fault_stream = UnixStream::connect(socket_path).map_err(Error::Connect)?;
-        ConnectionRole::Fault
-            .write_to(&mut fault_stream)
-            .map_err(Error::Protocol)?;
+        let connection_count = connections.get() as usize;
+        let mut fault_streams = Vec::with_capacity(connection_count);
+        for worker_index in 0..connection_count {
+            let mut fault_stream = UnixStream::connect(socket_path).map_err(Error::Connect)?;
+            ConnectionRole::Fault
+                .write_to(&mut fault_stream)
+                .map_err(Error::Protocol)?;
+            fault_streams.push((worker_index, fault_stream));
+        }
         info!(
-            "offload daemon: connected dedicated fault connection, serving {} slot(s)",
+            "offload daemon: connected {connection_count} dedicated fault connections, serving {} slot(s)",
             slots.len()
         );
-        let serve_slots = Arc::clone(&slots);
-        let handle = thread::Builder::new()
-            .name("offload-fault-serve".to_owned())
-            .spawn(move || serve_page_faults(&mut fault_stream, serve_slots.as_slice()))
-            .map_err(Error::SpawnServeThread)?;
-        Some(handle)
+
+        let mut serve_handles = Vec::with_capacity(fault_streams.len());
+        let mut start_txs = Vec::with_capacity(fault_streams.len());
+        for (worker_index, mut fault_stream) in fault_streams {
+            let serve_slots = Arc::clone(&slots);
+            let (start_tx, start_rx) = mpsc::channel();
+            let handle = thread::Builder::new()
+                .name(format!("uffd-src-{worker_index}"))
+                .spawn(move || {
+                    if start_rx.recv().is_err() {
+                        return Ok(());
+                    }
+                    serve_page_faults(&mut fault_stream, serve_slots.as_slice(), worker_index)
+                })
+                .map_err(Error::SpawnServeThread);
+
+            match handle {
+                Ok(handle) => {
+                    serve_handles.push(handle);
+                    start_txs.push(start_tx);
+                }
+                Err(e) => {
+                    drop(start_txs);
+                    for handle in serve_handles {
+                        handle.join().ok();
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        for start_tx in start_txs {
+            start_tx
+                .send(())
+                .expect("fault serve thread must wait for its startup signal");
+        }
+        serve_handles
     } else {
-        None
+        Vec::new()
     };
 
     send_payload_expect_ok(
@@ -486,9 +556,20 @@ fn run_restore(socket_path: &Path, input_dir: &Path, resume: bool, ondemand: boo
     };
     send_request_expect_ok(&mut stream, final_req, "Complete")?;
 
-    if let Some(handle) = serve_handle {
+    if !serve_handles.is_empty() {
         info!("Offload daemon: waiting for fault serving to finish");
-        handle.join().map_err(|_| Error::ServeThreadPanic)??;
+        let mut first_error = None;
+        for handle in serve_handles {
+            let result = handle.join().unwrap_or(Err(Error::ServeThreadPanic));
+            if let Err(error) = result
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
     }
 
     info!("Restore replay finished");
@@ -524,13 +605,19 @@ impl OnDemandSlot {
     }
 }
 
-fn serve_page_faults(stream: &mut UnixStream, slots: &[OnDemandSlot]) -> Result<()> {
+fn serve_page_faults(
+    stream: &mut UnixStream,
+    slots: &[OnDemandSlot],
+    worker_index: usize,
+) -> Result<()> {
     let mut served: u64 = 0;
     loop {
         let req = match Request::read_from(stream) {
             Ok(r) => r,
             Err(e) => {
-                info!("Serve loop: socket closed after {served} PageFault(s) ({e:?})");
+                info!(
+                    "Fault worker {worker_index}: socket closed after {served} PageFault(s) ({e:?})"
+                );
                 return Ok(());
             }
         };
@@ -540,7 +627,7 @@ fn serve_page_faults(stream: &mut UnixStream, slots: &[OnDemandSlot]) -> Result<
                 served += 1;
                 if served <= 5 || served.is_power_of_two() {
                     info!(
-                        "PageFault #{served}: gpa={:#x} len={}",
+                        "Fault worker {worker_index}: PageFault #{served}: gpa={:#x} len={}",
                         range.gpa, range.length
                     );
                 }
@@ -561,7 +648,7 @@ fn serve_page_faults(stream: &mut UnixStream, slots: &[OnDemandSlot]) -> Result<
                 Response::ok().write_to(stream).map_err(Error::Protocol)?;
             }
             Command::Abandon => {
-                info!("Serve loop: received Abandon, exiting");
+                info!("Fault worker {worker_index}: received Abandon, exiting");
                 Response::ok().write_to(stream).ok();
                 return Ok(());
             }
@@ -636,6 +723,70 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    fn restore_connections(args: &[&str]) -> result::Result<NonZeroU32, clap::Error> {
+        let mut command = vec![
+            "offload_daemon",
+            "restore",
+            "--socket",
+            "/tmp/offload.sock",
+            "--input-dir",
+            "/tmp/snapshot",
+        ];
+        command.extend_from_slice(args);
+
+        match Cli::try_parse_from(command)?.mode {
+            Mode::Restore { connections, .. } => {
+                Ok(connections.unwrap_or(DEFAULT_FAULT_CONNECTIONS))
+            }
+            Mode::Snapshot { .. } => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn test_restore_connection_count() {
+        assert_eq!(restore_connections(&["--ondemand"]).unwrap().get(), 1);
+        assert_eq!(
+            restore_connections(&["--ondemand", "--connections", "1"])
+                .unwrap()
+                .get(),
+            1
+        );
+        assert_eq!(
+            restore_connections(&["--ondemand", "--connections", "4"])
+                .unwrap()
+                .get(),
+            4
+        );
+        assert_eq!(
+            restore_connections(&["--ondemand", "--connections", "128"])
+                .unwrap()
+                .get(),
+            128
+        );
+        restore_connections(&["--ondemand", "--connections", "0"]).unwrap_err();
+        restore_connections(&["--ondemand", "--connections", "129"]).unwrap_err();
+    }
+
+    #[test]
+    fn test_restore_rejects_connections_without_ondemand() {
+        restore_connections(&["--connections", "1"]).unwrap_err();
+    }
+
+    #[test]
+    fn test_snapshot_rejects_connection_count() {
+        Cli::try_parse_from([
+            "offload_daemon",
+            "snapshot",
+            "--socket",
+            "/tmp/offload.sock",
+            "--output-dir",
+            "/tmp/snapshot",
+            "--connections",
+            "2",
+        ])
+        .unwrap_err();
+    }
 
     #[test]
     fn test_memory_slot_filename() {
