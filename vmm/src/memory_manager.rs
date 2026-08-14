@@ -69,6 +69,10 @@ struct UffdHandler {
     fault_socket_fd: Option<OwnedFd>,
 }
 
+struct UffdHandlerResult {
+    index: usize,
+    result: Result<(), io::Error>,
+}
 const UFFD_PAGE_EMPTY: u8 = 0;
 const UFFD_PAGE_LOADING: u8 = 1;
 const UFFD_PAGE_READY: u8 = 2;
@@ -1203,7 +1207,10 @@ impl MemoryManager {
                     Err(io::Error::other("UFFD handler thread panicked"))
                 });
 
-                if result_tx.send(result).is_ok() {
+                if result_tx
+                    .send(UffdHandlerResult { index: 0, result })
+                    .is_ok()
+                {
                     thread_result_event.write(1).ok();
                 }
             })
@@ -1228,7 +1235,7 @@ impl MemoryManager {
                         watchdog_exit_event,
                         thread_watchdog_stop_event,
                         result_event,
-                        handler_stop_event,
+                        vec![handler_stop_event],
                         result_rx,
                     ) {
                         error!("uffd-handler-main thread errored out: {e}");
@@ -1310,8 +1317,8 @@ impl MemoryManager {
         exit_evt: EventFd,
         stop_event: EventFd,
         result_event: EventFd,
-        handler_stop_event: EventFd,
-        result_rx: Receiver<Result<(), io::Error>>,
+        handlers_stop_events: Vec<EventFd>,
+        result_rx: Receiver<UffdHandlerResult>,
     ) -> Result<(), io::Error> {
         const EVENT_STOP: u64 = 0;
         const EVENT_RESULT: u64 = 1;
@@ -1336,56 +1343,77 @@ impl MemoryManager {
         )
         .map_err(io::Error::other)?;
 
+        let mut active_handlers = handlers_stop_events.len();
         let mut events = vec![epoll::Event::new(epoll::Events::empty(), 0); 2];
-        loop {
+
+        while active_handlers > 0 {
             let num_events = match epoll::wait(epoll_fd, -1, &mut events) {
                 Ok(n) => n,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(e),
             };
 
-            if events
-                .iter()
-                .take(num_events)
-                .any(|event| event.data == EVENT_STOP)
-            {
-                stop_event.read().ok();
-                handler_stop_event.write(1).ok();
+            let mut should_shutdown = false;
+
+            for event in events.iter().take(num_events) {
+                match event.data {
+                    EVENT_STOP => match stop_event.read() {
+                        Ok(_) => should_shutdown = true,
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                        Err(e) => return Err(e),
+                    },
+                    EVENT_RESULT => {
+                        match result_event.read() {
+                            Ok(_) => {}
+                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                            Err(e) => return Err(e),
+                        }
+
+                        loop {
+                            match result_rx.try_recv() {
+                                Ok(UffdHandlerResult {
+                                    index,
+                                    result: Ok(()),
+                                }) => {
+                                    info!("UFFD handler {index} exited successfully");
+                                    active_handlers -= 1;
+                                }
+                                Ok(UffdHandlerResult {
+                                    index,
+                                    result: Err(e),
+                                }) => {
+                                    error!("UFFD handler {index} exited with error: {e}");
+                                    exit_evt.write(1).ok();
+                                    active_handlers -= 1;
+                                    should_shutdown = true;
+                                }
+                                Err(mpsc::TryRecvError::Empty) => break,
+                                Err(mpsc::TryRecvError::Disconnected) => {
+                                    if active_handlers > 0 {
+                                        return Err(io::Error::new(
+                                            io::ErrorKind::BrokenPipe,
+                                            "UFFD handler result channel disconnected",
+                                        ));
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            if should_shutdown {
+                handlers_stop_events.iter().for_each(|stop_event| {
+                    stop_event.write(1).ok();
+                });
+
                 return Ok(());
             }
-
-            if events
-                .iter()
-                .take(num_events)
-                .any(|event| event.data == EVENT_RESULT)
-            {
-                match result_event.read() {
-                    Ok(_) => {}
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-                    Err(e) => return Err(e),
-                }
-
-                match result_rx.try_recv() {
-                    Ok(Ok(())) => {
-                        info!("UFFD handler exited successfully");
-                        return Ok(());
-                    }
-                    Ok(Err(e)) => {
-                        error!("UFFD handler exited with error: {e}");
-                        exit_evt.write(1).ok();
-                        handler_stop_event.write(1).ok();
-                        return Ok(());
-                    }
-                    Err(mpsc::TryRecvError::Empty) => continue,
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::BrokenPipe,
-                            "UFFD handler result channel disconnected",
-                        ));
-                    }
-                }
-            }
         }
+
+        Ok(())
     }
 
     /// Serve UFFD faults via `source`, prefaulting one page per idle
