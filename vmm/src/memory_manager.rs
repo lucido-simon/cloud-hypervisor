@@ -66,10 +66,8 @@ use crate::{GuestMemoryMmap, GuestRegionMmap, MEMORY_MANAGER_SNAPSHOT_ID, userfa
 
 struct UffdHandler {
     stop_event: EventFd,
-    result_rx: Receiver<Result<(), io::Error>>,
     handle: thread::JoinHandle<()>,
     fault_socket_fd: Option<OwnedFd>,
-    prefault_complete: Arc<AtomicBool>,
 }
 
 const UFFD_PAGE_EMPTY: u8 = 0;
@@ -383,6 +381,8 @@ pub struct MemoryManager {
     // slots that the mapping is created in.
     guest_ram_mappings: Vec<GuestRamMapping>,
     uffd_handler: Option<UffdHandler>,
+    uffd_watchdog: Option<UffdHandler>,
+    uffd_prefault_complete: Option<Arc<AtomicBool>>,
 
     pub acpi_address: Option<GuestAddress>,
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
@@ -1244,8 +1244,15 @@ impl MemoryManager {
 
         let stop_event = EventFd::new(libc::EFD_NONBLOCK).map_err(Error::EventFdFail)?;
         let thread_stop_event = stop_event.try_clone().map_err(Error::EventFdFail)?;
-        let thread_exit_evt = exit_evt.try_clone().map_err(Error::EventFdFail)?;
-        let panic_exit_evt = exit_evt.try_clone().map_err(Error::EventFdFail)?;
+        let handler_stop_event = stop_event.try_clone().map_err(Error::EventFdFail)?;
+        let watchdog_stop_event =
+            EventFd::new(libc::EFD_NONBLOCK).map_err(UffdError::SpawnThread)?;
+        let thread_watchdog_stop_event = watchdog_stop_event
+            .try_clone()
+            .map_err(Error::EventFdFail)?;
+        let watchdog_exit_event = exit_evt.try_clone().map_err(Error::EventFdFail)?;
+        let watchdog_error_event = exit_evt.try_clone().map_err(Error::EventFdFail)?;
+        let watchdog_panic_event = exit_evt.try_clone().map_err(Error::EventFdFail)?;
         let (startup_event_tx, startup_event_rx) = mpsc::sync_channel(1);
         let (start_tx, start_rx) = mpsc::sync_channel(1);
         let startup = UffdHandlerStartup {
@@ -1254,68 +1261,94 @@ impl MemoryManager {
             ready_notified: Cell::new(false),
         };
         let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let result_event = EventFd::new(libc::EFD_NONBLOCK).map_err(UffdError::SpawnThread)?;
+        let thread_result_event = result_event.try_clone().map_err(UffdError::SpawnThread)?;
         let prefault_complete = Arc::new(AtomicBool::new(false));
         let thread_prefault_complete = Arc::clone(&prefault_complete);
         let handle = thread::Builder::new()
             .name("uffd-handler".to_string())
             .spawn(move || {
                 let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                    let result = Self::uffd_handler_loop(
+                    Self::uffd_handler_loop(
                         uffd_fd,
                         thread_stop_event,
                         source,
                         &handler_ranges,
                         &startup,
                         &thread_prefault_complete,
-                    );
-
-                    if let Err(e) = &result {
-                        error!("UFFD handler exited with error: {e}");
-                        thread_exit_evt.write(1).ok();
-                    }
-
-                    result
+                    )
                 }))
                 .unwrap_or_else(|_| {
                     error!("uffd-handler thread panicked");
-                    panic_exit_evt.write(1).ok();
                     Err(io::Error::other("UFFD handler thread panicked"))
                 });
 
                 startup.notify_exit_before_ready();
-                result_tx.send(result).ok();
+                if result_tx.send(result).is_ok() {
+                    thread_result_event.write(1).ok();
+                }
             })
             .map_err(UffdError::SpawnThread)?;
+
+        let handler = UffdHandler {
+            stop_event,
+            handle,
+            fault_socket_fd,
+        };
 
         if let Err(e) =
             wait_for_uffd_handler_startup(&startup_event_rx, 1, UFFD_HANDLER_STARTUP_TIMEOUT)
         {
             drop(start_tx);
-            handle.join().ok();
+            Self::stop_uffd_handler_thread(handler);
             return Err(UffdError::HandlerStartup(e).into());
         }
 
+        let watchdog_handle = match thread::Builder::new()
+            .name("uffd-handler-main".to_string())
+            .spawn(move || {
+                panic::catch_unwind(panic::AssertUnwindSafe(move || {
+                    if let Err(e) = Self::uffd_watchdog_thread(
+                        watchdog_exit_event,
+                        thread_watchdog_stop_event,
+                        result_event,
+                        handler_stop_event,
+                        result_rx,
+                    ) {
+                        error!("uffd-handler-main thread errored out: {e}");
+                        watchdog_error_event.write(1).ok();
+                    }
+                }))
+                .map_err(|_| {
+                    error!("uffd-handler-main thread panicked");
+                    watchdog_panic_event.write(1).ok();
+                })
+                .ok();
+            }) {
+            Ok(handle) => handle,
+            Err(e) => {
+                drop(start_tx);
+                Self::stop_uffd_handler_thread(handler);
+                return Err(UffdError::SpawnThread(e).into());
+            }
+        };
+
+        self.uffd_handler = Some(handler);
+        self.uffd_watchdog = Some(UffdHandler {
+            stop_event: watchdog_stop_event,
+            handle: watchdog_handle,
+            fault_socket_fd: None,
+        });
+        self.uffd_prefault_complete = Some(prefault_complete);
+
         if start_tx.send(()).is_err() {
-            handle.join().ok();
+            self.stop_uffd_handler();
             return Err(UffdError::HandlerStartup(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "UFFD handler start channel disconnected",
             ))
             .into());
         }
-
-        if let Ok(Err(e)) = result_rx.try_recv() {
-            handle.join().ok();
-            return Err(UffdError::HandlerFailed(e).into());
-        }
-
-        self.uffd_handler = Some(UffdHandler {
-            stop_event,
-            result_rx,
-            handle,
-            fault_socket_fd,
-            prefault_complete,
-        });
 
         Ok(())
     }
@@ -1339,28 +1372,114 @@ impl MemoryManager {
 
     fn stop_uffd_handler(&mut self) {
         if let Some(uffd_handler) = self.uffd_handler.take() {
-            uffd_handler.stop_event.write(1).ok();
-            if let Some(fd) = &uffd_handler.fault_socket_fd {
-                // SAFETY: fd is a valid owned fd for the duration of this call.
-                unsafe { libc::shutdown(fd.as_raw_fd(), libc::SHUT_RDWR) };
-            }
-            uffd_handler.handle.join().ok();
-
-            match uffd_handler.result_rx.try_recv() {
-                Ok(Err(e)) => error!("UFFD handler terminated with error: {e}"),
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    warn!("UFFD handler terminated unexpectedly (possible panic)");
-                }
-                _ => {}
-            }
+            Self::stop_uffd_handler_thread(uffd_handler);
         }
+
+        if let Some(watchdog) = self.uffd_watchdog.take() {
+            watchdog.stop_event.write(1).ok();
+            watchdog.handle.join().ok();
+        }
+
+        self.uffd_prefault_complete = None;
+    }
+
+    fn stop_uffd_handler_thread(uffd_handler: UffdHandler) {
+        uffd_handler.stop_event.write(1).ok();
+        if let Some(fd) = &uffd_handler.fault_socket_fd {
+            // SAFETY: fd is a valid owned fd for the duration of this call.
+            unsafe { libc::shutdown(fd.as_raw_fd(), libc::SHUT_RDWR) };
+        }
+        uffd_handler.handle.join().ok();
     }
 
     /// True while an on-demand (UFFD) restore is still faulting in guest RAM.
     pub fn restoring(&self) -> bool {
-        self.uffd_handler
+        self.uffd_prefault_complete
             .as_ref()
-            .is_some_and(|h| !h.prefault_complete.load(Ordering::Acquire))
+            .is_some_and(|complete| !complete.load(Ordering::Acquire))
+    }
+
+    #[expect(clippy::needless_pass_by_value)]
+    fn uffd_watchdog_thread(
+        exit_evt: EventFd,
+        stop_event: EventFd,
+        result_event: EventFd,
+        handler_stop_event: EventFd,
+        result_rx: Receiver<Result<(), io::Error>>,
+    ) -> Result<(), io::Error> {
+        const EVENT_STOP: u64 = 0;
+        const EVENT_RESULT: u64 = 1;
+
+        let epoll_fd = epoll::create(true).map_err(io::Error::other)?;
+        // SAFETY: epoll_fd is valid and owned by this scope.
+        let _epoll_file = unsafe { File::from_raw_fd(epoll_fd) };
+
+        epoll::ctl(
+            epoll_fd,
+            epoll::ControlOptions::EPOLL_CTL_ADD,
+            stop_event.as_raw_fd(),
+            epoll::Event::new(epoll::Events::EPOLLIN, EVENT_STOP),
+        )
+        .map_err(io::Error::other)?;
+
+        epoll::ctl(
+            epoll_fd,
+            epoll::ControlOptions::EPOLL_CTL_ADD,
+            result_event.as_raw_fd(),
+            epoll::Event::new(epoll::Events::EPOLLIN, EVENT_RESULT),
+        )
+        .map_err(io::Error::other)?;
+
+        let mut events = vec![epoll::Event::new(epoll::Events::empty(), 0); 2];
+        loop {
+            let num_events = match epoll::wait(epoll_fd, -1, &mut events) {
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+
+            if events
+                .iter()
+                .take(num_events)
+                .any(|event| event.data == EVENT_STOP)
+            {
+                stop_event.read().ok();
+                handler_stop_event.write(1).ok();
+                return Ok(());
+            }
+
+            if events
+                .iter()
+                .take(num_events)
+                .any(|event| event.data == EVENT_RESULT)
+            {
+                match result_event.read() {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                    Err(e) => return Err(e),
+                }
+
+                match result_rx.try_recv() {
+                    Ok(Ok(())) => {
+                        info!("UFFD handler exited successfully");
+                        return Ok(());
+                    }
+                    Ok(Err(e)) => {
+                        error!("UFFD handler exited with error: {e}");
+                        exit_evt.write(1).ok();
+                        handler_stop_event.write(1).ok();
+                        return Ok(());
+                    }
+                    Err(mpsc::TryRecvError::Empty) => continue,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "UFFD handler result channel disconnected",
+                        ));
+                    }
+                }
+            }
+        }
     }
 
     /// Serve UFFD faults via `source`, prefaulting one page per idle
@@ -2113,6 +2232,8 @@ impl MemoryManager {
             memory_zones,
             guest_ram_mappings: Vec::new(),
             uffd_handler: None,
+            uffd_watchdog: None,
+            uffd_prefault_complete: None,
             acpi_address,
             log_dirty: dynamic, // Cannot log dirty pages on a TD
             arch_mem_regions,
