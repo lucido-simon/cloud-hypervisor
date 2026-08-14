@@ -4,6 +4,7 @@
 //
 
 use std::collections::BTreeMap;
+use std::sync::mpsc;
 use std::{io, result};
 
 use anyhow::anyhow;
@@ -53,8 +54,12 @@ pub enum UffdError {
     #[error("Failed to spawn handler thread")]
     SpawnThread(#[source] io::Error),
 
-    #[error("Handler terminated before startup completed")]
-    HandlerStartup,
+    #[error("Handler {index} startup failed")]
+    HandlerStartup {
+        index: usize,
+        #[source]
+        source: mpsc::RecvError,
+    },
 
     #[error("Handler failed after startup")]
     HandlerFailed(#[source] io::Error),

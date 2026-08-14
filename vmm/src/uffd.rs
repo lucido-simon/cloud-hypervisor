@@ -240,6 +240,7 @@ struct UffdioRange {
 
 /// A guest memory range registered with userfaultfd, plus where its bytes
 /// live for the data source.
+#[derive(Copy, Clone)]
 pub(crate) struct UffdRange {
     pub host_addr: u64,
     pub length: u64,
