@@ -70,9 +70,10 @@ struct UffdHandler {
 }
 
 struct UffdHandlerResult {
-    index: usize,
+    role: UffdHandlerRole,
     result: Result<(), io::Error>,
 }
+
 const UFFD_PAGE_EMPTY: u8 = 0;
 const UFFD_PAGE_LOADING: u8 = 1;
 const UFFD_PAGE_READY: u8 = 2;
@@ -320,6 +321,12 @@ pub struct MemoryManager {
     pub acpi_address: Option<GuestAddress>,
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     uefi_flash: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
+}
+
+#[derive(Copy, Clone)]
+enum UffdHandlerRole {
+    Handler(usize),
+    Prefaulter,
 }
 
 #[derive(Error, Debug)]
@@ -1247,16 +1254,46 @@ impl MemoryManager {
                 thread::Builder::new()
                     .name(format!("uffd-handler-{index}").to_string())
                     .spawn(move || {
-                        let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                            Self::uffd_worker_thread(
-                                uffd_fd,
-                                thread_stop_event,
-                                source,
-                                &ranges,
-                                &ready_tx,
-                                page_tracker,
-                                num_handlers == 1,
-                            )
+                        let role = if index == 1 {
+                            UffdHandlerRole::Prefaulter
+                        } else {
+                            UffdHandlerRole::Handler(index)
+                        };
+
+                        let result = panic::catch_unwind(panic::AssertUnwindSafe(|| match role {
+                            UffdHandlerRole::Prefaulter => {
+                                let result = Self::uffd_prefault_thread(
+                                    uffd_fd,
+                                    thread_stop_event,
+                                    source,
+                                    &ranges,
+                                    &ready_tx,
+                                    page_tracker,
+                                );
+
+                                if let Err(e) = &result {
+                                    error!("UFFD prefaulter {index} exited with error: {e}");
+                                }
+
+                                result
+                            }
+                            UffdHandlerRole::Handler(_) => {
+                                let result = Self::uffd_worker_thread(
+                                    uffd_fd,
+                                    thread_stop_event,
+                                    source,
+                                    &ranges,
+                                    &ready_tx,
+                                    page_tracker,
+                                    num_handlers == 1,
+                                );
+
+                                if let Err(e) = &result {
+                                    error!("UFFD handler {index} exited with error: {e}");
+                                }
+
+                                result
+                            }
                         }))
                         .unwrap_or_else(|_| {
                             error!("uffd-handler-{index} thread panicked");
@@ -1265,7 +1302,7 @@ impl MemoryManager {
                             )))
                         });
 
-                        if result_tx.send(UffdHandlerResult { index, result }).is_ok() {
+                        if result_tx.send(UffdHandlerResult { role, result }).is_ok() {
                             thread_result_event.write(1).ok();
                         }
                     })
@@ -1420,6 +1457,52 @@ impl MemoryManager {
         handlers_stop_events: Vec<EventFd>,
         result_rx: Receiver<UffdHandlerResult>,
     ) -> Result<(), io::Error> {
+        fn handle_worker_result(result: UffdHandlerResult, exit_evt: &EventFd) -> bool {
+            match result {
+                UffdHandlerResult {
+                    role: UffdHandlerRole::Prefaulter,
+                    result: Ok(_),
+                } => {
+                    // Great, prefaulting is done, no more pages to serve. Wind
+                    // down all threads. This might happen because all pages
+                    // were installed or because we're stopping all threads from
+                    // the VMM thread. There's no side effect from writing twice
+                    // in stop_event, so do it indiscriminately.
+                    info!("UFFD prefaulter exited successfully.");
+
+                    true
+                }
+                UffdHandlerResult {
+                    role: UffdHandlerRole::Prefaulter,
+                    result: Err(e),
+                } => {
+                    error!("UFFD prefaulter thread exited with {e}.");
+                    exit_evt.write(1).ok();
+
+                    true
+                }
+                UffdHandlerResult {
+                    role: UffdHandlerRole::Handler(index),
+                    result: Ok(_),
+                } => {
+                    info!("UFFD Handler thread {index} exited successfully.");
+
+                    false
+                }
+                UffdHandlerResult {
+                    role: UffdHandlerRole::Handler(index),
+                    result: Err(e),
+                } => {
+                    error!("UFFD Handler thread {index} exited with {e}.");
+                    // TODO: We could exit only if this is the last handler
+                    // thread alive.
+                    exit_evt.write(1).ok();
+
+                    true
+                }
+            }
+        }
+
         const EVENT_STOP: u64 = 0;
         const EVENT_RESULT: u64 = 1;
 
@@ -1471,21 +1554,9 @@ impl MemoryManager {
 
                         loop {
                             match result_rx.try_recv() {
-                                Ok(UffdHandlerResult {
-                                    index,
-                                    result: Ok(()),
-                                }) => {
-                                    info!("UFFD handler {index} exited successfully");
+                                Ok(result) => {
+                                    should_shutdown |= handle_worker_result(result, &exit_evt);
                                     active_handlers -= 1;
-                                }
-                                Ok(UffdHandlerResult {
-                                    index,
-                                    result: Err(e),
-                                }) => {
-                                    error!("UFFD handler {index} exited with error: {e}");
-                                    exit_evt.write(1).ok();
-                                    active_handlers -= 1;
-                                    should_shutdown = true;
                                 }
                                 Err(mpsc::TryRecvError::Empty) => break,
                                 Err(mpsc::TryRecvError::Disconnected) => {
@@ -1499,6 +1570,10 @@ impl MemoryManager {
                                 }
                             }
                         }
+
+                        // We may have received another thread result in the
+                        // meanwhile. Don't shutdown yet
+                        continue;
                     }
                     _ => {}
                 }
@@ -1516,8 +1591,6 @@ impl MemoryManager {
         Ok(())
     }
 
-    /// Serve UFFD faults via `source`, prefaulting one page per idle
-    /// iteration.
     #[expect(clippy::needless_pass_by_value)]
     fn uffd_worker_thread(
         uffd_fd: OwnedFd,
@@ -1530,14 +1603,7 @@ impl MemoryManager {
     ) -> Result<(), io::Error> {
         let uffd_raw_fd = uffd_fd.as_raw_fd();
 
-        let total_pages: u64 = ranges.iter().map(UffdRange::num_pages).sum();
-        let mut pages_served: u64 = 0;
-        let mut pages_prefaulted: u64 = 0;
-
-        let mut prefault_active = eager_prefault && !ranges.is_empty();
-        let mut range_idx = 0;
-        let mut page_idx = 0;
-        let prefault_start = time::Instant::now();
+        let mut pages_served = 0;
 
         const EVENT_STOP: u64 = 0;
         const EVENT_UFFD: u64 = 1;
@@ -1565,10 +1631,15 @@ impl MemoryManager {
         ready_tx.send(()).ok();
 
         let mut events = vec![epoll::Event::new(epoll::Events::empty(), 0); 2];
+        let timeout = if eager_prefault { 0 } else { -1 };
+
+        // Variables used only in eager_prefault mode
+        let mut page_idx = 0;
+        let mut range_idx = 0;
+
         loop {
             // Block only when prefault is done; otherwise poll non-blocking
             // so we can advance prefault between faults.
-            let timeout = if prefault_active { 0 } else { -1 };
             let num_events = match epoll::wait(epoll_fd, timeout, &mut events) {
                 Ok(n) => n,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -1583,7 +1654,9 @@ impl MemoryManager {
                 .any(|event| event.data == EVENT_STOP)
             {
                 stop_event.read().ok();
-                info!("UFFD handler: received stop event, exiting");
+                info!(
+                    "UFFD handler: received stop event, exiting after {pages_served} pages served."
+                );
                 return Ok(());
             }
 
@@ -1687,37 +1760,24 @@ impl MemoryManager {
                         "UFFD handler: fault at {fault_addr:#x} does not belong to any registered range",
                     )));
                 }
+            } else if eager_prefault {
+                let prefaulted = Self::uffd_prefault(
+                    uffd_fd.as_fd(),
+                    &mut range_idx,
+                    &mut page_idx,
+                    ranges,
+                    &mut source,
+                    &page_tracker,
+                )?;
 
-                continue;
-            }
-
-            if !prefault_active {
-                continue;
-            }
-
-            match Self::uffd_prefault(
-                uffd_fd.as_fd(),
-                &mut range_idx,
-                &mut page_idx,
-                ranges,
-                &mut source,
-                &page_tracker,
-            ) {
-                Ok(0) => {
-                    let elapsed = prefault_start.elapsed();
-                    info!(
-                        "UFFD handler: prefault done in {elapsed:.3?} — \
-                         prefaulted={pages_prefaulted} served={pages_served} \
-                         total={total_pages}"
-                    );
+                if prefaulted == 0 {
+                    // Reached the end of the last range — every page is
+                    // mapped, so no future faults can occur. Exit.
+                    info!("UFFD handler: prefault done");
                     return Ok(());
                 }
-                Ok(prefaulted) => pages_prefaulted += prefaulted,
-                Err(e) => {
-                    // Give up prefaulting but continue serving demand faults.
-                    warn!("UFFD prefault: abandoning background prefault after error: {e}");
-                    prefault_active = false;
-                }
+
+                continue;
             }
         }
     }
@@ -1744,6 +1804,7 @@ impl MemoryManager {
 
                     *range_idx = current_range_idx;
                     *page_idx = current_page_idx;
+
                     return Ok(0);
                 }
                 break;
@@ -1776,9 +1837,73 @@ impl MemoryManager {
                 Err(e) => {
                     let page_addr = range.page_addr(current_page_idx);
                     warn!("UFFD prefault: source error at {page_addr:#x}: {e}");
+                    warn!("UFFD prefault: abandoning background prefault after error");
                     return Err(e);
                 }
             }
+        }
+    }
+
+    #[expect(clippy::needless_pass_by_value)]
+    fn uffd_prefault_thread(
+        uffd_fd: OwnedFd,
+        stop_event: EventFd,
+        mut source: Box<dyn UffdMemorySource>,
+        ranges: &[UffdRange],
+        ready_tx: &SyncSender<()>,
+        page_tracker: Arc<UffdPageTracker>,
+    ) -> Result<(), io::Error> {
+        if ranges.is_empty() {
+            return Ok(());
+        }
+
+        let total_pages: u64 = ranges.iter().map(UffdRange::num_pages).sum();
+        let mut pages_prefaulted: u64 = 0;
+        let mut range_idx = 0;
+        let mut page_idx = 0;
+        let prefault_start = time::Instant::now();
+
+        ready_tx.send(()).ok();
+
+        loop {
+            match stop_event.read() {
+                Ok(_) => {
+                    info!("UFFD prefault handler: received stop event, exiting");
+                    return Ok(());
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e),
+            }
+
+            let prefaulted = match Self::uffd_prefault(
+                uffd_fd.as_fd(),
+                &mut range_idx,
+                &mut page_idx,
+                ranges,
+                &mut source,
+                &page_tracker,
+            ) {
+                Ok(prefaulted) => prefaulted,
+                Err(e) => {
+                    if stop_event.read().is_ok() {
+                        info!("UFFD prefault handler: stop received after source error, exiting");
+                        return Ok(());
+                    }
+                    return Err(e);
+                }
+            };
+
+            if prefaulted == 0 {
+                let elapsed = prefault_start.elapsed();
+                info!("UFFD prefault: prefault done.");
+                info!(
+                    "UFFD prefault: prefaulted {pages_prefaulted} out of {total_pages} in {:.2} seconds.",
+                    elapsed.as_secs_f64()
+                );
+                return Ok(());
+            }
+
+            pages_prefaulted += prefaulted;
         }
     }
 
