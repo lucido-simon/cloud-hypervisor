@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+use std::cell::Cell;
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -145,6 +146,77 @@ impl Drop for UffdPageClaim<'_> {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum UffdHandlerStartupEvent {
+    Ready,
+    Exited,
+}
+
+struct UffdHandlerStartup {
+    event_tx: SyncSender<UffdHandlerStartupEvent>,
+    start_rx: Receiver<()>,
+    ready_notified: Cell<bool>,
+}
+
+impl UffdHandlerStartup {
+    fn notify_ready_and_wait(&self) -> Result<(), io::Error> {
+        // Publish at most one startup event for this worker, including if the
+        // send itself unwinds. A send failure means the coordinator is gone.
+        self.ready_notified.set(true);
+        self.event_tx
+            .send(UffdHandlerStartupEvent::Ready)
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "UFFD handler startup channel disconnected",
+                )
+            })?;
+        self.start_rx.recv().map_err(|_| {
+            io::Error::new(io::ErrorKind::Interrupted, "UFFD handler startup cancelled")
+        })
+    }
+
+    fn notify_exit_before_ready(&self) {
+        if !self.ready_notified.get() {
+            self.event_tx.send(UffdHandlerStartupEvent::Exited).ok();
+        }
+    }
+}
+
+fn wait_for_uffd_handler_startup(
+    event_rx: &Receiver<UffdHandlerStartupEvent>,
+    num_handlers: usize,
+    timeout: time::Duration,
+) -> Result<(), io::Error> {
+    let deadline = time::Instant::now() + timeout;
+
+    for _ in 0..num_handlers {
+        let remaining = deadline.saturating_duration_since(time::Instant::now());
+        match event_rx.recv_timeout(remaining) {
+            Ok(UffdHandlerStartupEvent::Ready) => {}
+            Ok(UffdHandlerStartupEvent::Exited) => {
+                return Err(io::Error::other(
+                    "UFFD handler exited before startup completed",
+                ));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "UFFD handler startup timed out",
+                ));
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "UFFD handler startup channel disconnected",
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 pub const MEMORY_MANAGER_ACPI_SIZE: usize = 0x18;
 
 const DEFAULT_MEMORY_ZONE: &str = "mem0";
@@ -165,6 +237,8 @@ const MPOL_MF_MOVE: u32 = 1 << 1;
 const PLATFORM_DEVICE_AREA_SIZE: u64 = 1 << 20;
 
 const MAX_PREFAULT_THREAD_COUNT: usize = 16;
+
+const UFFD_HANDLER_STARTUP_TIMEOUT: time::Duration = time::Duration::from_secs(30);
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct HotPlugState {
@@ -1172,20 +1246,26 @@ impl MemoryManager {
         let thread_stop_event = stop_event.try_clone().map_err(Error::EventFdFail)?;
         let thread_exit_evt = exit_evt.try_clone().map_err(Error::EventFdFail)?;
         let panic_exit_evt = exit_evt.try_clone().map_err(Error::EventFdFail)?;
-        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let (startup_event_tx, startup_event_rx) = mpsc::sync_channel(1);
+        let (start_tx, start_rx) = mpsc::sync_channel(1);
+        let startup = UffdHandlerStartup {
+            event_tx: startup_event_tx,
+            start_rx,
+            ready_notified: Cell::new(false),
+        };
         let (result_tx, result_rx) = mpsc::sync_channel(1);
         let prefault_complete = Arc::new(AtomicBool::new(false));
         let thread_prefault_complete = Arc::clone(&prefault_complete);
         let handle = thread::Builder::new()
             .name("uffd-handler".to_string())
             .spawn(move || {
-                panic::catch_unwind(panic::AssertUnwindSafe(move || {
+                let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
                     let result = Self::uffd_handler_loop(
                         uffd_fd,
                         thread_stop_event,
                         source,
                         &handler_ranges,
-                        &ready_tx,
+                        &startup,
                         &thread_prefault_complete,
                     );
 
@@ -1194,19 +1274,34 @@ impl MemoryManager {
                         thread_exit_evt.write(1).ok();
                     }
 
-                    result_tx.send(result).ok();
+                    result
                 }))
-                .map_err(|_| {
+                .unwrap_or_else(|_| {
                     error!("uffd-handler thread panicked");
                     panic_exit_evt.write(1).ok();
-                })
-                .ok();
+                    Err(io::Error::other("UFFD handler thread panicked"))
+                });
+
+                startup.notify_exit_before_ready();
+                result_tx.send(result).ok();
             })
             .map_err(UffdError::SpawnThread)?;
 
-        if ready_rx.recv().is_err() {
+        if let Err(e) =
+            wait_for_uffd_handler_startup(&startup_event_rx, 1, UFFD_HANDLER_STARTUP_TIMEOUT)
+        {
+            drop(start_tx);
             handle.join().ok();
-            return Err(UffdError::HandlerStartup.into());
+            return Err(UffdError::HandlerStartup(e).into());
+        }
+
+        if start_tx.send(()).is_err() {
+            handle.join().ok();
+            return Err(UffdError::HandlerStartup(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "UFFD handler start channel disconnected",
+            ))
+            .into());
         }
 
         if let Ok(Err(e)) = result_rx.try_recv() {
@@ -1276,7 +1371,7 @@ impl MemoryManager {
         stop_event: EventFd,
         mut source: Box<dyn UffdMemorySource>,
         ranges: &[UffdRange],
-        ready_tx: &SyncSender<()>,
+        startup: &UffdHandlerStartup,
         prefault_complete: &AtomicBool,
     ) -> Result<(), io::Error> {
         let uffd_raw_fd = uffd_fd.as_raw_fd();
@@ -1315,7 +1410,7 @@ impl MemoryManager {
         )
         .map_err(io::Error::other)?;
 
-        ready_tx.send(()).ok();
+        startup.notify_ready_and_wait()?;
 
         let mut events = vec![epoll::Event::new(epoll::Events::empty(), 0); 2];
         loop {
@@ -3579,5 +3674,48 @@ impl Migratable for MemoryManager {
             table.extend(sub_table);
         }
         Ok(table)
+    }
+}
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::sync::mpsc;
+    use std::time;
+
+    use super::{UffdHandlerStartup, wait_for_uffd_handler_startup};
+
+    #[test]
+    fn uffd_handler_exit_interrupts_startup_wait() {
+        let (event_tx, event_rx) = mpsc::sync_channel(1);
+        let (_start_tx, start_rx) = mpsc::sync_channel(1);
+        let startup = UffdHandlerStartup {
+            event_tx,
+            start_rx,
+            ready_notified: Cell::new(false),
+        };
+
+        startup.notify_exit_before_ready();
+
+        assert!(
+            wait_for_uffd_handler_startup(&event_rx, 1, time::Duration::from_secs(30)).is_err()
+        );
+    }
+
+    #[test]
+    fn uffd_handler_exit_does_not_duplicate_readiness_event() {
+        let (event_tx, event_rx) = mpsc::sync_channel(1);
+        let (start_tx, start_rx) = mpsc::sync_channel(1);
+        let startup = UffdHandlerStartup {
+            event_tx,
+            start_rx,
+            ready_notified: Cell::new(false),
+        };
+        start_tx.send(()).unwrap();
+
+        startup.notify_ready_and_wait().unwrap();
+        wait_for_uffd_handler_startup(&event_rx, 1, time::Duration::from_secs(30)).unwrap();
+        startup.notify_exit_before_ready();
+
+        assert_eq!(event_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
     }
 }
