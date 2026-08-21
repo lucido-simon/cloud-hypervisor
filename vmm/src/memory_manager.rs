@@ -1435,6 +1435,7 @@ impl MemoryManager {
                 }
 
                 let fault_addr = msg.pf_address;
+                let minor_fault = msg.pf_flags & userfaultfd::UFFD_PAGEFAULT_FLAG_MINOR != 0;
 
                 let mut served = false;
                 for (range_idx, range) in ranges.iter().enumerate() {
@@ -1448,7 +1449,23 @@ impl MemoryManager {
                             UffdPageClaimResult::Loading => {
                                 thread::yield_now();
                             }
-                            UffdPageClaimResult::Ready => break None,
+                            UffdPageClaimResult::Ready => {
+                                // The source contents are already installed. A
+                                // minor fault only needs the existing backing
+                                // page mapped into this VMA.
+                                if minor_fault {
+                                    match uffd::uffd_continue(
+                                        uffd_fd.as_fd(),
+                                        range.page_addr(page_idx),
+                                        range.page_size,
+                                    ) {
+                                        Ok(()) => {}
+                                        Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {}
+                                        Err(e) => return Err(e),
+                                    }
+                                }
+                                break None;
+                            }
                         }
                     };
 
