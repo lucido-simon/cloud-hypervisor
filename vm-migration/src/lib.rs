@@ -37,6 +37,14 @@ pub enum UffdError {
         source: vm_memory::GuestMemoryError,
     },
 
+    #[error("Failed to disable transparent huge pages for region at {addr:#x}+{len:#x}")]
+    DisableThp {
+        addr: u64,
+        len: u64,
+        #[source]
+        source: io::Error,
+    },
+
     #[error("Failed to register region at {addr:#x}+{len:#x}")]
     Register {
         addr: u64,

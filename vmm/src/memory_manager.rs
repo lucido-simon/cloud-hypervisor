@@ -34,6 +34,7 @@ use virtio_devices::BlocksState;
 use virtio_devices::mem::Error as VirtioMemError;
 #[cfg(target_arch = "x86_64")]
 use vm_allocator::GsiApic;
+use vm_allocator::page_size::get_page_size;
 use vm_allocator::{AddressAllocator, MemorySlotAllocator, SystemAllocator};
 use vm_device::BusDevice;
 use vm_memory::bitmap::AtomicBitmap;
@@ -73,6 +74,61 @@ struct UffdHandler {
 struct UffdHandlerResult {
     role: UffdHandlerRole,
     result: Result<(), io::Error>,
+}
+
+/// Disables THP across a set of UFFD ranges while any handler is active.
+///
+/// A huge folio makes more than one base page present at once, suppressing the
+/// faults needed to populate the remaining pages from the restore source. The
+/// offload daemon disables THP on its mapping of the same memfd as well.
+struct ThpRestoreGuard {
+    /// Ranges to re-advise `MADV_HUGEPAGE` on drop. Empty unless the VM was
+    /// configured for THP, since nothing applied that advice otherwise.
+    restore: Vec<(u64, u64)>,
+}
+
+impl ThpRestoreGuard {
+    fn disable(ranges: &[UffdRange], thp: bool) -> Result<Self, Error> {
+        let base_page_size = get_page_size();
+        let mut guard = Self {
+            restore: Vec::new(),
+        };
+
+        for range in ranges {
+            Self::advise(range.host_addr, range.length, libc::MADV_NOHUGEPAGE).map_err(
+                |source| UffdError::DisableThp {
+                    addr: range.host_addr,
+                    len: range.length,
+                    source,
+                },
+            )?;
+            if thp && range.page_size == base_page_size {
+                guard.restore.push((range.host_addr, range.length));
+            }
+        }
+
+        Ok(guard)
+    }
+
+    fn advise(addr: u64, len: u64, advice: libc::c_int) -> Result<(), io::Error> {
+        // SAFETY: the UFFD range describes a live guest-memory mapping.
+        let ret = unsafe { libc::madvise(addr as *mut libc::c_void, len as usize, advice) };
+        if ret == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+}
+
+impl Drop for ThpRestoreGuard {
+    fn drop(&mut self) {
+        for &(addr, len) in &self.restore {
+            if let Err(e) = Self::advise(addr, len, libc::MADV_HUGEPAGE) {
+                warn!("Failed to restore THP advice for region at {addr:#x}+{len:#x}: {e}");
+            }
+        }
+    }
 }
 
 const UFFD_PAGE_EMPTY: u8 = 0;
@@ -1093,7 +1149,7 @@ impl MemoryManager {
         else {
             return Ok(());
         };
-        self.spawn_uffd_handlers(uffd_fd, sources, ranges, exit_evt)?;
+        self.spawn_uffd_handlers(uffd_fd, sources, ranges, None, exit_evt)?;
         info!("UFFD restore: demand-paged restore enabled");
         Ok(())
     }
@@ -1139,7 +1195,14 @@ impl MemoryManager {
             return Ok(());
         };
 
-        self.spawn_uffd_handlers(uffd_fd, sockets, ranges, exit_evt)
+        // This must be applied to every mapping of the shared memfd. A large
+        // folio created through either mapping would make neighboring pages
+        // appear present before their snapshot contents have been installed.
+        let thp_guard = shared_backing
+            .then(|| ThpRestoreGuard::disable(&ranges, self.thp))
+            .transpose()?;
+
+        self.spawn_uffd_handlers(uffd_fd, sockets, ranges, thp_guard, exit_evt)
     }
 
     /// Create a UFFD fd and register every range.
@@ -1159,8 +1222,7 @@ impl MemoryManager {
         let guest_memory = self.guest_memory.memory();
         let required_uffd_features = self.required_uffd_features(uffd_requires_minor_mode);
 
-        // SAFETY: FFI call. Trivially safe.
-        let base_page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+        let base_page_size = get_page_size();
 
         info!(
             "UFFD: registering {} region(s) for demand paging",
@@ -1237,6 +1299,7 @@ impl MemoryManager {
         uffd_fd: OwnedFd,
         sources: Vec<(Box<dyn UffdMemorySource>, Option<OwnedFd>)>,
         handler_ranges: Vec<UffdRange>,
+        thp_guard: Option<ThpRestoreGuard>,
         exit_evt: &EventFd,
     ) -> Result<(), Error> {
         // Start with the worker threads
@@ -1253,6 +1316,9 @@ impl MemoryManager {
         // Track pages being loaded as well as completed pages so concurrent
         // workers cannot repeat source side effects for the same page.
         let page_tracker = Arc::new(UffdPageTracker::new(&handler_ranges));
+        // Every worker holds a clone so THP is restored only after the last
+        // worker has stopped, including early-error and panic paths.
+        let thp_guard = thp_guard.map(Arc::new);
 
         let mut handlers = Vec::with_capacity(num_handlers);
         let mut ready_rxs = Vec::with_capacity(num_handlers);
@@ -1269,10 +1335,12 @@ impl MemoryManager {
                 let thread_result_event =
                     result_event.try_clone().map_err(UffdError::SpawnThread)?;
                 let page_tracker = page_tracker.clone();
+                let thp_guard = thp_guard.clone();
 
                 thread::Builder::new()
                     .name(format!("uffd-handler-{index}").to_string())
                     .spawn(move || {
+                        let _thp_guard = thp_guard;
                         let role = if index == 1 {
                             UffdHandlerRole::Prefaulter
                         } else {

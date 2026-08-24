@@ -104,6 +104,8 @@ enum Error {
     MissingField(&'static str),
     #[error("Mapping memfd for the on demand slot")]
     Mmap(#[source] MmapRegionError),
+    #[error("Disabling transparent huge pages for the on demand slot")]
+    DisableThp(#[source] io::Error),
     #[error("Guest region does not match the mapped size")]
     GuestRegion,
     #[error("Cloning memfd for mmap")]
@@ -593,6 +595,15 @@ impl OnDemandSlot {
             libc::MAP_SHARED,
         )
         .map_err(Error::Mmap)?;
+        // This mapping is not UFFD-registered, so a huge folio faulted through
+        // it would make neighboring pages present before their snapshot bytes
+        // are written. CH opts its own mapping out for the same reason.
+        // SAFETY: mmap.as_ptr() and mmap.size() describe this live mapping.
+        let ret =
+            unsafe { libc::madvise(mmap.as_ptr().cast(), mmap.size(), libc::MADV_NOHUGEPAGE) };
+        if ret != 0 {
+            return Err(Error::DisableThp(io::Error::last_os_error()));
+        }
         let region = GuestRegionMmap::new(mmap, GuestAddress(gpa)).ok_or(Error::GuestRegion)?;
         let disk = File::open(disk_path).map_err(Error::ReadFile)?;
         Ok(Self { region, disk })
@@ -824,5 +835,41 @@ mod tests {
             parse_guest_ram_mappings(&value),
             Err(Error::MissingField("file_offset"))
         ));
+    }
+
+    /// Parses the `<start>-<end> ...` header line that opens each
+    /// `/proc/self/smaps` entry. Returns `None` for its `Key: value` lines.
+    fn smaps_entry_range(line: &str) -> Option<(usize, usize)> {
+        let (start, end) = line.split_once(' ')?.0.split_once('-')?;
+        Some((
+            usize::from_str_radix(start, 16).ok()?,
+            usize::from_str_radix(end, 16).ok()?,
+        ))
+    }
+
+    #[test]
+    fn test_on_demand_slot_disables_thp() {
+        // SAFETY: FFI call. Trivially safe.
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+        let memfd = create_empty_memfd(page_size, "test-ondemand-slot").unwrap();
+        let slot = OnDemandSlot::new(&memfd, 0, page_size, 0, Path::new("/dev/zero")).unwrap();
+        let host_addr = slot
+            .region
+            .get_host_address(MemoryRegionAddress(0))
+            .unwrap() as usize;
+        let smaps = fs::read_to_string("/proc/self/smaps").unwrap();
+
+        let vm_flags = smaps
+            .lines()
+            .skip_while(|line| {
+                !smaps_entry_range(line)
+                    .is_some_and(|(start, end)| start <= host_addr && host_addr < end)
+            })
+            .skip(1)
+            .take_while(|line| smaps_entry_range(line).is_none())
+            .find_map(|line| line.strip_prefix("VmFlags:"))
+            .expect("Could not find VmFlags for on demand mapping");
+
+        assert!(vm_flags.split_ascii_whitespace().any(|flag| flag == "nh"));
     }
 }
