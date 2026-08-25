@@ -301,19 +301,25 @@ impl MemoryZone {
         self.virtio_mem_zone.as_mut()
     }
 
-    fn backing_page_size_for_gpa(&self, gpa: u64) -> Option<u64> {
-        if self.regions.iter().any(|region| {
+    fn contains_gpa(&self, gpa: u64) -> bool {
+        self.regions.iter().any(|region| {
             let start = region.start_addr().raw_value();
             gpa >= start && gpa < start + region.len()
-        }) {
+        }) || self
+            .virtio_mem_zone
+            .as_ref()
+            .is_some_and(|virtio_mem_zone| {
+                let start = virtio_mem_zone.region.start_addr().raw_value();
+                gpa >= start && gpa < start + virtio_mem_zone.region.len()
+            })
+    }
+
+    fn backing_page_size_for_gpa(&self, gpa: u64) -> Option<u64> {
+        if self.contains_gpa(gpa) {
             return Some(self.backing_page_size);
         }
 
-        self.virtio_mem_zone.as_ref().and_then(|virtio_mem_zone| {
-            let start = virtio_mem_zone.region.start_addr().raw_value();
-            (gpa >= start && gpa < start + virtio_mem_zone.region.len())
-                .then_some(self.backing_page_size)
-        })
+        None
     }
 }
 
@@ -1205,29 +1211,16 @@ impl MemoryManager {
         self.spawn_uffd_handlers(uffd_fd, sockets, ranges, thp_guard, exit_evt)
     }
 
-    /// Create a UFFD fd and register every range.
-    fn prepare_uffd<F>(
-        &mut self,
+    fn uffd_ranges<F>(
+        &self,
         saved_regions: &MemoryRangeTable,
         mut source_offset_for: F,
-        uffd_requires_minor_mode: bool,
-    ) -> Result<Option<(OwnedFd, Vec<UffdRange>)>, Error>
+    ) -> Result<Vec<UffdRange>, Error>
     where
         F: FnMut(&MemoryRange) -> u64,
     {
-        if saved_regions.is_empty() {
-            return Ok(None);
-        }
-
         let guest_memory = self.guest_memory.memory();
-        let required_uffd_features = self.required_uffd_features(uffd_requires_minor_mode);
-
         let base_page_size = get_page_size();
-
-        info!(
-            "UFFD: registering {} region(s) for demand paging",
-            saved_regions.regions().len()
-        );
 
         if saved_regions
             .regions()
@@ -1237,26 +1230,66 @@ impl MemoryManager {
             return Err(UffdError::UnalignedRanges.into());
         }
 
+        saved_regions
+            .regions()
+            .iter()
+            .map(|range| {
+                let host_addr = guest_memory
+                    .get_host_address(GuestAddress(range.gpa))
+                    .map_err(|e| UffdError::GpaTranslation {
+                        gpa: range.gpa,
+                        source: e,
+                    })? as u64;
+                let page_size = self
+                    .memory_zones
+                    .values()
+                    .find_map(|zone| zone.backing_page_size_for_gpa(range.gpa))
+                    .unwrap_or(base_page_size);
+
+                Ok(UffdRange {
+                    host_addr,
+                    length: range.length,
+                    source_offset: source_offset_for(range),
+                    page_size,
+                })
+            })
+            .collect()
+    }
+
+    /// Create a UFFD fd and register every range.
+    fn prepare_uffd<F>(
+        &mut self,
+        saved_regions: &MemoryRangeTable,
+        source_offset_for: F,
+        uffd_requires_minor_mode: bool,
+    ) -> Result<Option<(OwnedFd, Vec<UffdRange>)>, Error>
+    where
+        F: FnMut(&MemoryRange) -> u64,
+    {
+        if saved_regions.is_empty() {
+            return Ok(None);
+        }
+
+        let required_uffd_features = self.required_uffd_features(uffd_requires_minor_mode);
+
+        info!(
+            "UFFD: registering {} region(s) for demand paging",
+            saved_regions.regions().len()
+        );
+
+        let handler_ranges = self.uffd_ranges(saved_regions, source_offset_for)?;
+
         let uffd_fd = uffd::create(required_uffd_features).map_err(UffdError::Create)?;
 
-        let mut handler_ranges: Vec<UffdRange> = Vec::new();
-
-        for range in saved_regions.regions() {
-            let host_addr = guest_memory
-                .get_host_address(GuestAddress(range.gpa))
-                .map_err(|e| UffdError::GpaTranslation {
-                    gpa: range.gpa,
-                    source: e,
-                })? as u64;
-
+        for range in &handler_ranges {
             let ioctls = uffd::register(
                 uffd_fd.as_fd(),
-                host_addr,
+                range.host_addr,
                 range.length,
                 uffd_requires_minor_mode,
             )
             .map_err(|e| UffdError::Register {
-                addr: host_addr,
+                addr: range.host_addr,
                 len: range.length,
                 source: e,
             })?;
@@ -1269,24 +1302,11 @@ impl MemoryManager {
 
             if ioctls & required_ioctls != required_ioctls {
                 return Err(UffdError::MissingIoctlSupport {
-                    addr: host_addr,
+                    addr: range.host_addr,
                     len: range.length,
                 }
                 .into());
             }
-
-            let range_page_size = self
-                .memory_zones
-                .values()
-                .find_map(|zone| zone.backing_page_size_for_gpa(range.gpa))
-                .unwrap_or(base_page_size);
-
-            handler_ranges.push(UffdRange {
-                host_addr,
-                length: range.length,
-                source_offset: source_offset_for(range),
-                page_size: range_page_size,
-            });
         }
 
         Ok(Some((uffd_fd, handler_ranges)))
