@@ -24,8 +24,8 @@ use socket2::{SockRef, TcpKeepalive};
 use thiserror::Error;
 use vm_memory::bitmap::BitmapSlice;
 use vm_memory::{
-    Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic, ReadVolatile, VolatileMemoryError,
-    VolatileSlice, WriteVolatile,
+    Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryBackend,
+    GuestMemoryRegion, ReadVolatile, VolatileMemoryError, VolatileSlice, WriteVolatile,
 };
 use vm_migration::protocol::{Command, ConnectionRole, MemoryRangeTable, Request, Response};
 use vm_migration::tls::{TlsServerConfig, TlsStream};
@@ -40,6 +40,8 @@ use crate::{GuestMemoryMmap, VmMigrationConfig};
 /// Hard upper bound for migration worker connections on both the sender and
 /// receiver side.
 pub(crate) const MAX_MIGRATION_CONNECTIONS: u32 = 128;
+
+const MIN_MIGRATION_PAGE_SIZE: u64 = 4096;
 
 /// Transport-agnostic listener used to receive connections.
 #[derive(Debug)]
@@ -1266,7 +1268,11 @@ pub(crate) fn receive_memory_ranges(
 ) -> Result<(), MigratableError> {
     debug_assert_eq!(req.command(), Command::Memory);
     // Read the memory table
-    let ranges = MemoryRangeTable::read_from(socket, req.length())?;
+    let ranges = MemoryRangeTable::read_from(
+        socket,
+        req.length(),
+        max_memory_range_entries(guest_memory)?,
+    )?;
 
     // And then the memory itself
     let mem = guest_memory.memory();
@@ -1304,6 +1310,21 @@ pub(crate) fn receive_memory_ranges(
     }
 
     Ok(())
+}
+
+fn max_memory_range_entries(
+    guest_memory: &GuestMemoryAtomic<GuestMemoryMmap>,
+) -> Result<usize, MigratableError> {
+    let memory = guest_memory.memory();
+    let memory_bytes = memory.iter().try_fold(0u64, |total, region| {
+        total.checked_add(region.len()).ok_or_else(|| {
+            MigratableError::MigrateReceive(anyhow!("Guest memory size overflows u64"))
+        })
+    })?;
+    let max_entries = memory_bytes.div_ceil(MIN_MIGRATION_PAGE_SIZE);
+    usize::try_from(max_entries)
+        .context("Maximum memory range count does not fit in memory")
+        .map_err(MigratableError::MigrateReceive)
 }
 
 #[cfg(test)]

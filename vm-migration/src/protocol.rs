@@ -100,7 +100,7 @@
 use std::io::{Read, Write};
 use std::ops::RangeInclusive;
 
-use anyhow::anyhow;
+use anyhow::{Context, anyhow};
 use itertools::Itertools;
 use log::error;
 use serde::{Deserialize, Serialize};
@@ -575,11 +575,37 @@ impl MemoryRangeTable {
         self.data.push(range);
     }
 
-    pub fn read_from(fd: &mut dyn Read, length: u64) -> Result<MemoryRangeTable, MigratableError> {
-        assert!((length as usize).is_multiple_of(size_of::<MemoryRange>()));
+    pub fn read_from(
+        fd: &mut dyn Read,
+        length: u64,
+        max_entries: usize,
+    ) -> Result<MemoryRangeTable, MigratableError> {
+        let length = usize::try_from(length)
+            .with_context(|| {
+                format!("Memory range table payload length {length} does not fit in memory")
+            })
+            .map_err(MigratableError::MigrateReceive)?;
+        let range_size = size_of::<MemoryRange>();
+        if !length.is_multiple_of(range_size) {
+            return Err(MigratableError::MigrateReceive(anyhow!(
+                "Memory range table payload length {length} is not a multiple of {range_size}"
+            )));
+        }
 
-        let mut data: Vec<MemoryRange> =
-            vec![MemoryRange::default(); length as usize / size_of::<MemoryRange>()];
+        let range_count = length / range_size;
+        if range_count > max_entries {
+            return Err(MigratableError::MigrateReceive(anyhow!(
+                "Memory range table contains {range_count} ranges, exceeding the limit of {max_entries}"
+            )));
+        }
+
+        let mut data = Vec::new();
+        data.try_reserve_exact(range_count)
+            .with_context(|| {
+                format!("Failed to allocate memory range table for {range_count} ranges")
+            })
+            .map_err(MigratableError::MigrateReceive)?;
+        data.resize(range_count, MemoryRange::default());
 
         fd.read_exact(data.as_mut_bytes())
             .map_err(MigratableError::MigrateSocket)?;
@@ -622,6 +648,7 @@ impl MemoryRangeTable {
 mod tests {
     use std::io::Cursor;
 
+    use crate::MigratableError;
     use crate::protocol::{
         CURRENT_PROTOCOL_VERSION, Command, ConnectionRole, MemoryRange, MemoryRangeTable, Request,
     };
@@ -693,6 +720,38 @@ mod tests {
         // producing an out-of-range enum discriminant.
         let mut cursor = Cursor::new(99u16.to_le_bytes().to_vec());
         ConnectionRole::read_from(&mut cursor).unwrap_err();
+    }
+
+    #[test]
+    fn test_memory_range_table_rejects_malformed_length() {
+        let mut cursor = Cursor::new(Vec::<u8>::new());
+        let error = MemoryRangeTable::read_from(
+            &mut cursor,
+            size_of::<MemoryRange>() as u64 + 1,
+            usize::MAX,
+        )
+        .unwrap_err();
+        assert!(matches!(error, MigratableError::MigrateReceive(_)));
+    }
+
+    #[test]
+    fn test_memory_range_table_rejects_entry_count_over_limit() {
+        let range_count = 2;
+        let length = (range_count * size_of::<MemoryRange>()) as u64;
+        let mut cursor = Cursor::new(Vec::<u8>::new());
+        let error = MemoryRangeTable::read_from(&mut cursor, length, range_count - 1).unwrap_err();
+        assert!(matches!(error, MigratableError::MigrateReceive(_)));
+    }
+
+    #[test]
+    fn test_memory_range_table_reports_allocation_failure() {
+        let oversized_length = isize::MAX as u64 + 1;
+        assert!(oversized_length.is_multiple_of(size_of::<MemoryRange>() as u64));
+
+        let mut cursor = Cursor::new(Vec::<u8>::new());
+        let error =
+            MemoryRangeTable::read_from(&mut cursor, oversized_length, usize::MAX).unwrap_err();
+        assert!(matches!(error, MigratableError::MigrateReceive(_)));
     }
 
     #[test]
