@@ -1056,6 +1056,11 @@ impl Vmm {
                         l,
                         guest_memory.clone(),
                         fault_tx,
+                        if matches!(receive_data_migration.memory_mode, MigrationMode::Postcopy) {
+                            postcopy_connections.get()
+                        } else {
+                            0
+                        },
                         &self.seccomp_action,
                     )
                 })?;

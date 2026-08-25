@@ -309,6 +309,7 @@ impl ReceiveAdditionalConnections {
         listener: ReceiveListener,
         guest_memory: GuestMemoryAtomic<GuestMemoryMmap>,
         fault_tx: Sender<SocketStream>,
+        max_fault_connections: u32,
         seccomp_action: &SeccompAction,
     ) -> Result<Self, MigratableError> {
         let event_fd = EventFd::new(0)
@@ -338,6 +339,7 @@ impl ReceiveAdditionalConnections {
                     &kill_evt,
                     &guest_memory,
                     &fault_tx,
+                    max_fault_connections,
                     &seccomp_filter,
                 )
             })
@@ -355,7 +357,7 @@ impl ReceiveAdditionalConnections {
     ///
     /// Runs on the accept thread created by [`Self::new`]. It accepts sockets
     /// until termination is signaled, accepting/classifying a socket fails, or
-    /// the memory connection limit is exceeded.
+    /// either connection limit is exceeded.
     ///
     /// Each socket must send a [`ConnectionRole`] header soon after connecting.
     /// Invalid sockets are dropped. Fault sockets are sent through `fault_tx`.
@@ -366,6 +368,7 @@ impl ReceiveAdditionalConnections {
         kill_evt: &EventFd,
         guest_memory: &GuestMemoryAtomic<GuestMemoryMmap>,
         fault_tx: &Sender<SocketStream>,
+        max_fault_connections: u32,
         seccomp_filter: &BpfProgram,
     ) -> Result<(), MigratableError> {
         let mut threads = Vec::new();
@@ -374,6 +377,7 @@ impl ReceiveAdditionalConnections {
             kill_evt,
             guest_memory,
             fault_tx,
+            max_fault_connections,
             &mut threads,
             seccomp_filter,
         );
@@ -391,30 +395,33 @@ impl ReceiveAdditionalConnections {
     /// Runs the accept loop and spawns workers for memory connections.
     ///
     /// This accepts at most [`MAX_MIGRATION_CONNECTIONS`] precopy memory
-    /// connections, depending on how many additional connections the migration
-    /// sender opens. Fault connections (postcopy) are handed off to the main
-    /// migration thread and do not spawn workers.
+    /// connections, independently of the negotiated number of fault
+    /// connections. Fault connections are handed off to the main migration
+    /// thread and do not spawn workers.
     fn accept_connections_loop(
         listener: &mut ReceiveListener,
         kill_evt: &EventFd,
         guest_memory: &GuestMemoryAtomic<GuestMemoryMmap>,
         fault_tx: &Sender<SocketStream>,
+        max_fault_connections: u32,
         threads: &mut Vec<thread::JoinHandle<Result<(), MigratableError>>>,
         seccomp_filter: &BpfProgram,
     ) -> Result<(), MigratableError> {
+        let mut fault_connection_count = 0;
         loop {
             let socket = listener.abortable_accept(kill_evt)?;
             let Some(socket) = socket else {
                 return Ok(());
             };
 
-            if threads.len() >= MAX_MIGRATION_CONNECTIONS as usize {
-                return Err(MigratableError::MigrateReceive(anyhow!(
-                    "Received more than {MAX_MIGRATION_CONNECTIONS} additional migration connections."
-                )));
-            }
-
-            let Some(socket) = Self::handle_accepted_connection(socket, fault_tx)? else {
+            let Some(socket) = Self::handle_accepted_connection(
+                socket,
+                fault_tx,
+                threads.len(),
+                &mut fault_connection_count,
+                max_fault_connections as usize,
+            )?
+            else {
                 continue;
             };
 
@@ -437,6 +444,9 @@ impl ReceiveAdditionalConnections {
     fn handle_accepted_connection(
         mut socket: SocketStream,
         fault_tx: &Sender<SocketStream>,
+        precopy_worker_count: usize,
+        fault_connection_count: &mut usize,
+        max_fault_connections: usize,
     ) -> Result<Option<SocketStream>, MigratableError> {
         // Timeout the role header so one stalled peer cannot block the accept
         // thread from handling other connections.
@@ -462,14 +472,28 @@ impl ReceiveAdditionalConnections {
                 Ok(None)
             }
             ConnectionRole::Fault => {
+                if *fault_connection_count >= max_fault_connections {
+                    return Err(MigratableError::MigrateReceive(anyhow!(
+                        "Received more than {max_fault_connections} fault connections."
+                    )));
+                }
                 fault_tx.send(socket).map_err(|e| {
                     MigratableError::MigrateReceive(anyhow!(
                         "Failed to hand off fault connection: {e}"
                     ))
                 })?;
+                *fault_connection_count += 1;
                 Ok(None)
             }
-            ConnectionRole::PrecopyMemory => Ok(Some(socket)),
+            ConnectionRole::PrecopyMemory => {
+                if precopy_worker_count >= MAX_MIGRATION_CONNECTIONS as usize {
+                    return Err(MigratableError::MigrateReceive(anyhow!(
+                        "Received more than {MAX_MIGRATION_CONNECTIONS} precopy memory connections."
+                    )));
+                }
+
+                Ok(Some(socket))
+            }
         }
     }
 
@@ -1329,7 +1353,65 @@ fn max_memory_range_entries(
 
 #[cfg(test)]
 mod tests {
-    use super::tcp_address_to_server_name;
+    use std::os::unix::net::UnixStream;
+    use std::sync::mpsc::channel;
+
+    use vm_migration::MigratableError;
+    use vm_migration::protocol::ConnectionRole;
+
+    use super::{
+        MAX_MIGRATION_CONNECTIONS, ReceiveAdditionalConnections, SocketStream,
+        tcp_address_to_server_name,
+    };
+
+    fn socket_with_role(role: ConnectionRole) -> SocketStream {
+        let (mut peer, socket) = UnixStream::pair().unwrap();
+        role.write_to(&mut peer).unwrap();
+        SocketStream::Unix(socket)
+    }
+
+    #[test]
+    fn test_connection_role_limits_are_independent() {
+        let (fault_tx, fault_rx) = channel();
+        let socket = socket_with_role(ConnectionRole::Fault);
+        let mut fault_connection_count = 0;
+
+        let result = ReceiveAdditionalConnections::handle_accepted_connection(
+            socket,
+            &fault_tx,
+            MAX_MIGRATION_CONNECTIONS as usize,
+            &mut fault_connection_count,
+            1,
+        )
+        .unwrap();
+        assert!(result.is_none());
+        fault_rx.recv().unwrap();
+        assert_eq!(fault_connection_count, 1);
+
+        let socket = socket_with_role(ConnectionRole::PrecopyMemory);
+        let error = ReceiveAdditionalConnections::handle_accepted_connection(
+            socket,
+            &fault_tx,
+            MAX_MIGRATION_CONNECTIONS as usize,
+            &mut fault_connection_count,
+            1,
+        )
+        .err()
+        .expect("A precopy connection beyond the worker limit must fail");
+        assert!(matches!(error, MigratableError::MigrateReceive(_)));
+
+        let socket = socket_with_role(ConnectionRole::Fault);
+        let error = ReceiveAdditionalConnections::handle_accepted_connection(
+            socket,
+            &fault_tx,
+            0,
+            &mut fault_connection_count,
+            1,
+        )
+        .err()
+        .expect("A fault connection beyond its negotiated limit must fail");
+        assert!(matches!(error, MigratableError::MigrateReceive(_)));
+    }
 
     #[test]
     fn test_tcp_address_to_server_name() {
