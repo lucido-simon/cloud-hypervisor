@@ -95,6 +95,9 @@
 //! The protocol version must be bumped for breaking protocol changes, but not
 //! for additive ones.
 //!
+//! Protocol v1 adds [`Command::PostcopyDirty`] for the range-only handoff
+//! between a full precopy pass and postcopy fault handling.
+//!
 //! [start-command]: [`Command::Start`]
 
 use std::io::{Read, Write};
@@ -128,6 +131,8 @@ use crate::bitpos_iterator::BitposIteratorExt;
 ///     MemoryFdsReceived --> Configured: Config
 ///     Configured --> Configured: Memory
 ///     Configured --> StateReceived: State
+///     Configured --> PostcopyDirtyReceived: PostcopyDirty
+///     PostcopyDirtyReceived --> StateReceived: State
 ///     StateReceived --> Completed: Complete
 ///     StateReceived --> Completed: CompletePaused
 ///     Completed --> Completed: PageFault
@@ -154,6 +159,9 @@ pub enum Command {
     /// Request a page to be faulted in. The page content can be sent
     /// through the response or simply written to the shared memory.
     PageFault = 9,
+    /// Identifies memory dirtied after a full precopy pass. The payload
+    /// contains only a [`MemoryRangeTable`], without memory contents.
+    PostcopyDirty = 10,
 }
 
 /// Role announced as the first message on an additional migration connection.
@@ -200,7 +208,7 @@ impl TryFrom<u16> for ConnectionRole {
 }
 
 /// Newest migration protocol version sent by this implementation.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 0;
+pub const CURRENT_PROTOCOL_VERSION: u16 = 1;
 
 /// Returns the current migration protocol version and the previous version, if any.
 fn supported_protocol_versions() -> RangeInclusive<u16> {
@@ -249,6 +257,10 @@ impl Request {
 
     pub fn memory(length: u64) -> Self {
         Self::new(Command::Memory, length)
+    }
+
+    pub fn postcopy_dirty(length: u64) -> Self {
+        Self::new(Command::PostcopyDirty, length)
     }
 
     pub fn memory_fd(length: u64) -> Self {
@@ -651,7 +663,24 @@ mod tests {
     use crate::MigratableError;
     use crate::protocol::{
         CURRENT_PROTOCOL_VERSION, Command, ConnectionRole, MemoryRange, MemoryRangeTable, Request,
+        supported_protocol_versions,
     };
+
+    #[test]
+    fn test_supported_protocol_versions_include_v0_and_v1() {
+        assert_eq!(
+            supported_protocol_versions().collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+
+        let legacy_request = Request {
+            command: Command::Start,
+            command_headers: [0; 6],
+            length: 0,
+        };
+        assert_eq!(legacy_request.sender_protocol_version().unwrap(), 0);
+        assert_eq!(Request::start().sender_protocol_version().unwrap(), 1);
+    }
 
     #[test]
     fn test_start_request_ignores_residual_command_headers_bytes() {
@@ -661,22 +690,51 @@ mod tests {
             length: 0,
         };
 
-        assert_eq!(
-            u16::from_le_bytes([request.command_headers()[0], request.command_headers()[1]]),
-            1
-        );
+        assert_eq!(request.sender_protocol_version().unwrap(), 1);
     }
 
     #[test]
     fn test_sender_protocol_version_rejects_unsupported_version() {
+        const { assert!(CURRENT_PROTOCOL_VERSION < u16::MAX) };
+        let unsupported_version = CURRENT_PROTOCOL_VERSION + 1;
+        let mut command_headers = [0; 6];
+        command_headers[..size_of::<u16>()].copy_from_slice(&unsupported_version.to_le_bytes());
         let request = Request {
             command: Command::Start,
-            command_headers: [255, 0, 0, 0, 0, 0],
+            command_headers,
             length: 0,
         };
 
-        const { assert!(CURRENT_PROTOCOL_VERSION < 255) };
         request.sender_protocol_version().unwrap_err();
+    }
+
+    #[test]
+    fn test_postcopy_dirty_request_roundtrip() {
+        let mut nonempty_table = MemoryRangeTable::default();
+        nonempty_table.push(MemoryRange {
+            gpa: 0x4000,
+            length: 0x2000,
+        });
+
+        for table in [MemoryRangeTable::default(), nonempty_table] {
+            let request = Request::postcopy_dirty(table.length());
+            let mut buf = Vec::new();
+            request.write_to(&mut buf).unwrap();
+            table.write_to(&mut buf).unwrap();
+
+            let mut cursor = Cursor::new(buf);
+            let parsed_request = Request::read_from(&mut cursor).unwrap();
+            assert_eq!(parsed_request.command(), Command::PostcopyDirty);
+            assert_eq!(parsed_request.length(), table.length());
+            let parsed_table = MemoryRangeTable::read_from(
+                &mut cursor,
+                parsed_request.length(),
+                table.regions().len(),
+            )
+            .unwrap();
+            assert_eq!(parsed_table.regions(), table.regions());
+            assert_eq!(cursor.position(), cursor.get_ref().len() as u64);
+        }
     }
 
     #[test]

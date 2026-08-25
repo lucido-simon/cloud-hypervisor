@@ -420,3 +420,32 @@ features are added to existing device models or the VMM, the corresponding
 device-specific config falls back to safe false/disabled values. Hence, only
 newly spawned VMs will be able to use new functionality, while being able to run
 VMs first spawned in older versions of Cloud Hypervisor.
+
+### Technical Details
+
+Cloud Hypervisor uses a versioned migration protocol for the messages exchanged
+between source and destination. The source sends its migration protocol version
+in the initial `Start` request. The destination accepts the migration only if
+that protocol version is supported. A zeroed `Start` command header is handled
+as protocol `v0`, so older deployments that do not explicitly send a protocol
+version remain compatible.
+
+The migration protocol version covers the protocol spoken after a migration
+connection has been established. Examples include adding a mandatory migration
+command, changing the order of migration protocol messages, or changing the
+framing or encoding of protocol command payloads.
+
+Protocol version 1 adds the `PostcopyDirty` handoff used by live postcopy. A
+version 1 source sends the full memory image first, then identifies pages made
+stale while that image was copied. A version 1 destination continues to accept
+version 0 sources and uses their legacy all-pages-on-demand postcopy sequence.
+
+The migration protocol version does not cover migration transport setup. For
+example, choosing TCP vs. UNIX sockets or opening the initial connection needs
+separate compatibility handling.
+
+Migration protocol versioning is separate from snapshot state compatibility.
+Device and VM state changes still need to be handled by the respective snapshot
+serialization/deserialization code. That compatibility is Cloud Hypervisor
+version dependent, but it is not the responsibility of migration protocol
+versioning.

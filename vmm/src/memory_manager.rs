@@ -76,7 +76,8 @@ struct UffdHandlerResult {
     result: Result<(), io::Error>,
 }
 
-/// Disables THP across a set of UFFD ranges while any handler is active.
+/// Disables THP across a set of UFFD ranges before they are populated and
+/// while any handler is active.
 ///
 /// A huge folio makes more than one base page present at once, suppressing the
 /// faults needed to populate the remaining pages from the restore source. The
@@ -129,6 +130,43 @@ impl Drop for ThpRestoreGuard {
             }
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PostcopyDiscard {
+    DontNeed,
+}
+
+impl PostcopyDiscard {
+    fn advice(self) -> libc::c_int {
+        match self {
+            Self::DontNeed => libc::MADV_DONTNEED,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::DontNeed => "MADV_DONTNEED",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PostcopyMemoryRange {
+    gpa: u64,
+    host_addr: u64,
+    length: u64,
+    page_size: u64,
+    discard: PostcopyDiscard,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PostcopyDirtyRange {
+    gpa: u64,
+    host_addr: u64,
+    length: u64,
+    memory_range_gpa: u64,
+    discard: PostcopyDiscard,
 }
 
 const UFFD_PAGE_EMPTY: u8 = 0;
@@ -380,6 +418,7 @@ pub struct MemoryManager {
     guest_ram_mappings: Vec<GuestRamMapping>,
     uffd_handlers: Option<Vec<UffdHandler>>,
     uffd_watchdog: Option<UffdHandler>,
+    postcopy_thp_guard: Option<ThpRestoreGuard>,
 
     pub acpi_address: Option<GuestAddress>,
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
@@ -572,6 +611,28 @@ pub enum Error {
     /// Failed to prefault memory
     #[error("Failed to prefault memory")]
     PrefaultMemory(#[source] io::Error),
+
+    /// A postcopy dirty range does not describe valid guest memory.
+    #[error("Invalid postcopy dirty range at {gpa:#x}+{length:#x}: {reason}")]
+    InvalidPostcopyDirtyRange {
+        gpa: u64,
+        length: u64,
+        reason: &'static str,
+    },
+
+    /// The memory mapping cannot be invalidated safely for postcopy.
+    #[error("Unsupported postcopy memory at GPA {gpa:#x}: {reason}")]
+    UnsupportedPostcopyMemory { gpa: u64, reason: &'static str },
+
+    /// Failed to discard stale memory before postcopy.
+    #[error("Failed to invalidate postcopy memory at GPA {gpa:#x}+{length:#x} with {operation}")]
+    InvalidatePostcopyMemory {
+        gpa: u64,
+        length: u64,
+        operation: &'static str,
+        #[source]
+        source: io::Error,
+    },
 }
 
 impl From<UffdError> for Error {
@@ -1169,6 +1230,12 @@ impl MemoryManager {
         sockets: Vec<SocketStream>,
         exit_evt: &EventFd,
     ) -> Result<(), Error> {
+        if saved_regions.is_empty() {
+            // There will be no handler to own the early THP guard.
+            drop(self.postcopy_thp_guard.take());
+            return Ok(());
+        }
+
         // Make every fault a small request/response round-trip.
         sockets
             .iter()
@@ -1201,14 +1268,247 @@ impl MemoryManager {
             return Ok(());
         };
 
-        // This must be applied to every mapping of the shared memfd. A large
-        // folio created through either mapping would make neighboring pages
-        // appear present before their snapshot contents have been installed.
-        let thp_guard = shared_backing
-            .then(|| ThpRestoreGuard::disable(&ranges, self.thp))
-            .transpose()?;
+        // Hybrid migration disables THP before its first precopy write. Keep
+        // that guard alive through the UFFD worker lifetime. The fallback
+        // preserves direct callers that only require protection for shared
+        // backing once postcopy starts.
+        let thp_guard = if let Some(guard) = self.postcopy_thp_guard.take() {
+            Some(guard)
+        } else if shared_backing {
+            Some(ThpRestoreGuard::disable(&ranges, self.thp)?)
+        } else {
+            None
+        };
 
         self.spawn_uffd_handlers(uffd_fd, sockets, ranges, thp_guard, exit_evt)
+    }
+
+    /// Disable transparent huge pages before the full postcopy precopy pass is
+    /// written into guest memory.
+    pub(crate) fn prepare_postcopy_memory(
+        &mut self,
+        saved_regions: &MemoryRangeTable,
+    ) -> Result<(), Error> {
+        if saved_regions.is_empty() {
+            return Ok(());
+        }
+
+        // Reject mappings that cannot be invalidated without either exposing
+        // stale file contents or modifying a user-provided backing file.
+        self.postcopy_memory_ranges()?;
+
+        if self.postcopy_thp_guard.is_none() {
+            let ranges = self.uffd_ranges(saved_regions, |range| range.gpa)?;
+            self.postcopy_thp_guard = Some(ThpRestoreGuard::disable(&ranges, self.thp)?);
+        }
+
+        Ok(())
+    }
+
+    /// Discard pages dirtied after the full postcopy precopy pass.
+    ///
+    /// The returned table is sorted, deduplicated, aligned to the backing page
+    /// size, and split at actual guest-memory region boundaries. It is safe to
+    /// pass directly to [`Self::start_postcopy_serving`].
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "the received table is consumed at this migration-state boundary"
+    )]
+    pub(crate) fn invalidate_postcopy_dirty_pages(
+        &mut self,
+        dirty_ranges: MemoryRangeTable,
+    ) -> Result<MemoryRangeTable, Error> {
+        let memory_ranges = self.postcopy_memory_ranges()?;
+        let dirty_ranges = Self::canonicalize_postcopy_dirty_ranges(&dirty_ranges, &memory_ranges)?;
+
+        if dirty_ranges.is_empty() {
+            // Every page from the full precopy pass is already final, so UFFD
+            // will not be started and no worker can take ownership of the guard.
+            drop(self.postcopy_thp_guard.take());
+            return Ok(MemoryRangeTable::default());
+        }
+
+        Self::invalidate_postcopy_ranges(&dirty_ranges)?;
+
+        let mut canonical = MemoryRangeTable::default();
+        for range in dirty_ranges {
+            canonical.push(MemoryRange {
+                gpa: range.gpa,
+                length: range.length,
+            });
+        }
+
+        Ok(canonical)
+    }
+
+    fn invalidate_postcopy_ranges(dirty_ranges: &[PostcopyDirtyRange]) -> Result<(), Error> {
+        for range in dirty_ranges {
+            ThpRestoreGuard::advise(range.host_addr, range.length, range.discard.advice())
+                .map_err(|source| Error::InvalidatePostcopyMemory {
+                    gpa: range.gpa,
+                    length: range.length,
+                    operation: range.discard.name(),
+                    source,
+                })?;
+        }
+
+        Ok(())
+    }
+
+    fn postcopy_memory_ranges(&self) -> Result<Vec<PostcopyMemoryRange>, Error> {
+        let guest_memory = self.guest_memory.memory();
+        let mut ranges = Vec::new();
+
+        for region in guest_memory.iter() {
+            let gpa = region.start_addr().raw_value();
+            let zone = self
+                .memory_zones
+                .values()
+                .find(|zone| zone.contains_gpa(gpa))
+                .ok_or(Error::UnsupportedPostcopyMemory {
+                    gpa,
+                    reason: "guest region has no memory zone",
+                })?;
+            let discard = Self::postcopy_discard_for_mapping(
+                region.flags(),
+                region.file_offset().is_some(),
+                zone.hugepages,
+            )
+            .map_err(|reason| Error::UnsupportedPostcopyMemory { gpa, reason })?;
+            let length = region.len();
+            let page_size = zone.backing_page_size;
+            let host_addr = region.as_ptr() as u64;
+            if page_size == 0
+                || !page_size.is_power_of_two()
+                || !is_aligned(gpa, page_size)
+                || !is_aligned(length, page_size)
+                || !is_aligned(host_addr, page_size)
+            {
+                return Err(Error::UnsupportedPostcopyMemory {
+                    gpa,
+                    reason: "guest region is not aligned to its backing page size",
+                });
+            }
+
+            ranges.push(PostcopyMemoryRange {
+                gpa,
+                host_addr,
+                length,
+                page_size,
+                discard,
+            });
+        }
+
+        ranges.sort_unstable_by_key(|range| range.gpa);
+        Ok(ranges)
+    }
+
+    fn postcopy_discard_for_mapping(
+        flags: libc::c_int,
+        has_file: bool,
+        hugepages: bool,
+    ) -> Result<PostcopyDiscard, &'static str> {
+        if hugepages {
+            return Err("explicit hugetlb memory is not supported");
+        }
+        let shared = flags & libc::MAP_SHARED != 0;
+        let private = flags & libc::MAP_PRIVATE != 0;
+        if shared == private {
+            return Err("unknown guest-memory mapping type");
+        }
+        if shared {
+            return Err("shared memory can be accessed through mappings outside userfaultfd");
+        }
+        if has_file {
+            return Err("file-backed memory is not supported");
+        }
+        if private && flags & libc::MAP_ANONYMOUS != 0 {
+            return Ok(PostcopyDiscard::DontNeed);
+        }
+
+        Err("unknown guest-memory mapping type")
+    }
+
+    fn canonicalize_postcopy_dirty_ranges(
+        dirty_ranges: &MemoryRangeTable,
+        memory_ranges: &[PostcopyMemoryRange],
+    ) -> Result<Vec<PostcopyDirtyRange>, Error> {
+        let mut canonical = Vec::new();
+
+        for dirty_range in dirty_ranges.regions() {
+            let invalid = |reason| Error::InvalidPostcopyDirtyRange {
+                gpa: dirty_range.gpa,
+                length: dirty_range.length,
+                reason,
+            };
+            if dirty_range.length == 0 {
+                return Err(invalid("range is empty"));
+            }
+            let dirty_end = dirty_range
+                .gpa
+                .checked_add(dirty_range.length)
+                .ok_or_else(|| invalid("range end overflows"))?;
+            let mut cursor = dirty_range.gpa;
+            while cursor < dirty_end {
+                let memory_range = memory_ranges
+                    .iter()
+                    .find(|range| {
+                        cursor >= range.gpa && cursor < range.gpa.saturating_add(range.length)
+                    })
+                    .ok_or_else(|| invalid("range crosses a guest-memory hole"))?;
+                let memory_end = memory_range
+                    .gpa
+                    .checked_add(memory_range.length)
+                    .ok_or_else(|| invalid("guest region end overflows"))?;
+                let segment_end = dirty_end.min(memory_end);
+
+                let page_size = memory_range.page_size;
+                if page_size == 0 || !page_size.is_power_of_two() {
+                    return Err(invalid("guest region has an invalid page size"));
+                }
+                let aligned_gpa = align_down(cursor, page_size);
+                let aligned_end = segment_end
+                    .checked_add(page_size - 1)
+                    .map(|end| align_down(end, page_size))
+                    .ok_or_else(|| invalid("page-aligned range end overflows"))?;
+                if aligned_gpa < memory_range.gpa || aligned_end > memory_end {
+                    return Err(invalid(
+                        "page-aligned range crosses a guest-memory region boundary",
+                    ));
+                }
+
+                canonical.push(PostcopyDirtyRange {
+                    gpa: aligned_gpa,
+                    host_addr: memory_range
+                        .host_addr
+                        .checked_add(aligned_gpa - memory_range.gpa)
+                        .ok_or_else(|| invalid("host address overflows"))?,
+                    length: aligned_end - aligned_gpa,
+                    memory_range_gpa: memory_range.gpa,
+                    discard: memory_range.discard,
+                });
+                cursor = segment_end;
+            }
+        }
+
+        canonical.sort_unstable_by_key(|range| (range.memory_range_gpa, range.gpa));
+        let mut normalized: Vec<PostcopyDirtyRange> = Vec::with_capacity(canonical.len());
+        for range in canonical {
+            if let Some(previous) = normalized.last_mut()
+                && previous.memory_range_gpa == range.memory_range_gpa
+                && previous.discard == range.discard
+            {
+                let previous_end = previous.gpa + previous.length;
+                if range.gpa <= previous_end {
+                    let range_end = range.gpa + range.length;
+                    previous.length = previous_end.max(range_end) - previous.gpa;
+                    continue;
+                }
+            }
+            normalized.push(range);
+        }
+
+        Ok(normalized)
     }
 
     fn uffd_ranges<F>(
@@ -2492,6 +2792,7 @@ impl MemoryManager {
             guest_ram_mappings: Vec::new(),
             uffd_handlers: None,
             uffd_watchdog: None,
+            postcopy_thp_guard: None,
             acpi_address,
             log_dirty: dynamic, // Cannot log dirty pages on a TD
             arch_mem_regions,
@@ -4089,7 +4390,6 @@ impl Migratable for MemoryManager {
         Ok(table)
     }
 }
-
 // Reports whether every saved range is page-aligned and lies wholly inside a
 // single plain private-anonymous guest region — the MAP_FIXED overlay
 // preconditions. File-backed regions are rejected: their stale mapping
@@ -4187,6 +4487,7 @@ fn do_mmap_cow_saved_regions(
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Seek, SeekFrom, Write};
+    use std::slice;
 
     use vm_migration::protocol::{MemoryRange, MemoryRangeTable};
 
@@ -4301,5 +4602,267 @@ mod tests {
             do_mmap_cow_saved_regions(&gm, &file, &table, true).unwrap();
             assert_eq!(gm.read_obj::<u8>(GuestAddress(0)).unwrap(), 0xcd);
         }
+    }
+    fn dirty_table(ranges: &[(u64, u64)]) -> MemoryRangeTable {
+        let mut table = MemoryRangeTable::default();
+        for &(gpa, length) in ranges {
+            table.push(MemoryRange { gpa, length });
+        }
+        table
+    }
+
+    fn test_memory_range(
+        gpa: u64,
+        host_addr: u64,
+        length: u64,
+        page_size: u64,
+        discard: PostcopyDiscard,
+    ) -> PostcopyMemoryRange {
+        PostcopyMemoryRange {
+            gpa,
+            host_addr,
+            length,
+            page_size,
+            discard,
+        }
+    }
+
+    fn test_mapping(shared: bool, size: usize) -> MmapRegion<AtomicBitmap> {
+        MemoryManager::create_ram_region_raw(
+            &None, 0, size, false, false, shared, false, None, None, None, false,
+        )
+        .unwrap()
+    }
+
+    fn fill_page(mapping: &MmapRegion<AtomicBitmap>, page: usize, page_size: usize, value: u8) {
+        // SAFETY: the mapping is live and the selected page is within it.
+        let bytes =
+            unsafe { slice::from_raw_parts_mut(mapping.as_ptr().add(page * page_size), page_size) };
+        bytes.fill(value);
+    }
+
+    fn page_bytes(mapping: &MmapRegion<AtomicBitmap>, page: usize, page_size: usize) -> &[u8] {
+        // SAFETY: the mapping is live and the selected page is within it.
+        unsafe { slice::from_raw_parts(mapping.as_ptr().add(page * page_size), page_size) }
+    }
+
+    #[test]
+    fn test_postcopy_discard_for_mapping() {
+        assert_eq!(
+            MemoryManager::postcopy_discard_for_mapping(
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                false,
+                false,
+            ),
+            Ok(PostcopyDiscard::DontNeed)
+        );
+        assert_eq!(
+            MemoryManager::postcopy_discard_for_mapping(libc::MAP_SHARED, true, false),
+            Err("shared memory can be accessed through mappings outside userfaultfd")
+        );
+        assert_eq!(
+            MemoryManager::postcopy_discard_for_mapping(libc::MAP_SHARED, false, false),
+            Err("shared memory can be accessed through mappings outside userfaultfd")
+        );
+        assert_eq!(
+            MemoryManager::postcopy_discard_for_mapping(libc::MAP_PRIVATE, true, false),
+            Err("file-backed memory is not supported")
+        );
+        assert_eq!(
+            MemoryManager::postcopy_discard_for_mapping(libc::MAP_SHARED, true, true),
+            Err("explicit hugetlb memory is not supported")
+        );
+
+        let page_size = get_page_size() as usize;
+        let private = test_mapping(false, page_size);
+        assert_eq!(
+            MemoryManager::postcopy_discard_for_mapping(
+                private.flags(),
+                private.file_offset().is_some(),
+                false,
+            ),
+            Ok(PostcopyDiscard::DontNeed)
+        );
+        let shared = test_mapping(true, page_size);
+        assert_eq!(
+            MemoryManager::postcopy_discard_for_mapping(
+                shared.flags(),
+                shared.file_offset().is_some(),
+                false,
+            ),
+            Err("shared memory can be accessed through mappings outside userfaultfd")
+        );
+    }
+
+    #[test]
+    fn test_canonicalize_postcopy_dirty_ranges() {
+        let page_size = 0x1000;
+        let memory_ranges = [
+            test_memory_range(
+                0x1000,
+                0x10_0000,
+                3 * page_size,
+                page_size,
+                PostcopyDiscard::DontNeed,
+            ),
+            test_memory_range(
+                0x8000,
+                0x20_0000,
+                2 * page_size,
+                page_size,
+                PostcopyDiscard::DontNeed,
+            ),
+        ];
+        let dirty = dirty_table(&[
+            (0x8101, 1),
+            (0x2800, 0x900),
+            (0x1100, 0x100),
+            (0x2000, page_size),
+        ]);
+
+        let canonical =
+            MemoryManager::canonicalize_postcopy_dirty_ranges(&dirty, &memory_ranges).unwrap();
+
+        assert_eq!(
+            canonical,
+            vec![
+                PostcopyDirtyRange {
+                    gpa: 0x1000,
+                    host_addr: 0x10_0000,
+                    length: 3 * page_size,
+                    memory_range_gpa: 0x1000,
+                    discard: PostcopyDiscard::DontNeed,
+                },
+                PostcopyDirtyRange {
+                    gpa: 0x8000,
+                    host_addr: 0x20_0000,
+                    length: page_size,
+                    memory_range_gpa: 0x8000,
+                    discard: PostcopyDiscard::DontNeed,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_canonicalize_postcopy_dirty_range_across_adjacent_regions() {
+        let page_size = 0x1000;
+        let memory_ranges = [
+            test_memory_range(
+                0x1000,
+                0x10_0000,
+                2 * page_size,
+                page_size,
+                PostcopyDiscard::DontNeed,
+            ),
+            test_memory_range(
+                0x3000,
+                0x20_0000,
+                2 * page_size,
+                page_size,
+                PostcopyDiscard::DontNeed,
+            ),
+        ];
+        let dirty = dirty_table(&[(0x2fff, 2)]);
+
+        let canonical =
+            MemoryManager::canonicalize_postcopy_dirty_ranges(&dirty, &memory_ranges).unwrap();
+
+        assert_eq!(
+            canonical,
+            vec![
+                PostcopyDirtyRange {
+                    gpa: 0x2000,
+                    host_addr: 0x10_1000,
+                    length: page_size,
+                    memory_range_gpa: 0x1000,
+                    discard: PostcopyDiscard::DontNeed,
+                },
+                PostcopyDirtyRange {
+                    gpa: 0x3000,
+                    host_addr: 0x20_0000,
+                    length: page_size,
+                    memory_range_gpa: 0x3000,
+                    discard: PostcopyDiscard::DontNeed,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_canonicalize_postcopy_dirty_ranges_rejects_invalid_ranges() {
+        let page_size = 0x1000;
+        let memory_ranges = [test_memory_range(
+            0x1000,
+            0x10_0000,
+            2 * page_size,
+            page_size,
+            PostcopyDiscard::DontNeed,
+        )];
+
+        for dirty in [
+            dirty_table(&[(0x1000, 0)]),
+            dirty_table(&[(u64::MAX, 1)]),
+            dirty_table(&[(0x3000, 1)]),
+            dirty_table(&[(0x2fff, 2)]),
+        ] {
+            assert!(matches!(
+                MemoryManager::canonicalize_postcopy_dirty_ranges(&dirty, &memory_ranges),
+                Err(Error::InvalidPostcopyDirtyRange { .. })
+            ));
+        }
+
+        let ranges_with_hole = [
+            memory_ranges[0],
+            test_memory_range(
+                0x4000,
+                0x20_0000,
+                page_size,
+                page_size,
+                PostcopyDiscard::DontNeed,
+            ),
+        ];
+        assert!(matches!(
+            MemoryManager::canonicalize_postcopy_dirty_ranges(
+                &dirty_table(&[(0x2fff, 0x1002)]),
+                &ranges_with_hole,
+            ),
+            Err(Error::InvalidPostcopyDirtyRange { .. })
+        ));
+    }
+
+    #[test]
+    fn test_postcopy_invalidation_dontneed_private_anonymous() {
+        let page_size = get_page_size() as usize;
+        let mapping = test_mapping(false, 3 * page_size);
+        fill_page(&mapping, 0, page_size, 0x11);
+        fill_page(&mapping, 1, page_size, 0x22);
+        fill_page(&mapping, 2, page_size, 0x33);
+
+        MemoryManager::invalidate_postcopy_ranges(&[PostcopyDirtyRange {
+            gpa: page_size as u64,
+            // SAFETY: the offset stays within the live mapping.
+            host_addr: unsafe { mapping.as_ptr().add(page_size) } as u64,
+            length: page_size as u64,
+            memory_range_gpa: 0,
+            discard: PostcopyDiscard::DontNeed,
+        }])
+        .unwrap();
+
+        assert!(
+            page_bytes(&mapping, 0, page_size)
+                .iter()
+                .all(|byte| *byte == 0x11)
+        );
+        assert!(
+            page_bytes(&mapping, 1, page_size)
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+        assert!(
+            page_bytes(&mapping, 2, page_size)
+                .iter()
+                .all(|byte| *byte == 0x33)
+        );
     }
 }

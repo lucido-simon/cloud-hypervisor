@@ -1336,6 +1336,22 @@ pub(crate) fn receive_memory_ranges(
     Ok(())
 }
 
+/// Receive the table of ranges dirtied during the full postcopy precopy pass.
+///
+/// The request carries no guest memory contents.
+pub(crate) fn receive_postcopy_dirty_ranges(
+    guest_memory: &GuestMemoryAtomic<GuestMemoryMmap>,
+    req: &Request,
+    socket: &mut SocketStream,
+) -> Result<MemoryRangeTable, MigratableError> {
+    debug_assert_eq!(req.command(), Command::PostcopyDirty);
+    MemoryRangeTable::read_from(
+        socket,
+        req.length(),
+        max_memory_range_entries(guest_memory)?,
+    )
+}
+
 fn max_memory_range_entries(
     guest_memory: &GuestMemoryAtomic<GuestMemoryMmap>,
 ) -> Result<usize, MigratableError> {
@@ -1353,15 +1369,17 @@ fn max_memory_range_entries(
 
 #[cfg(test)]
 mod tests {
+    use std::mem::size_of;
     use std::os::unix::net::UnixStream;
     use std::sync::mpsc::channel;
 
+    use vm_memory::{GuestAddress, GuestMemoryAtomic, GuestMemoryMmap};
     use vm_migration::MigratableError;
-    use vm_migration::protocol::ConnectionRole;
+    use vm_migration::protocol::{ConnectionRole, MemoryRange, Request};
 
     use super::{
         MAX_MIGRATION_CONNECTIONS, ReceiveAdditionalConnections, SocketStream,
-        tcp_address_to_server_name,
+        receive_postcopy_dirty_ranges, tcp_address_to_server_name,
     };
 
     fn socket_with_role(role: ConnectionRole) -> SocketStream {
@@ -1410,6 +1428,21 @@ mod tests {
         )
         .err()
         .expect("A fault connection beyond its negotiated limit must fail");
+        assert!(matches!(error, MigratableError::MigrateReceive(_)));
+    }
+
+    #[test]
+    fn test_postcopy_dirty_ranges_reject_count_over_guest_page_limit() {
+        let guest_memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x2000)])
+            .map(GuestMemoryAtomic::new)
+            .unwrap();
+        let (sender, receiver) = UnixStream::pair().unwrap();
+        drop(sender);
+        let mut socket = SocketStream::Unix(receiver);
+        let request = Request::postcopy_dirty((3 * size_of::<MemoryRange>()) as u64);
+
+        let error =
+            receive_postcopy_dirty_ranges(&guest_memory, &request, &mut socket).unwrap_err();
         assert!(matches!(error, MigratableError::MigrateReceive(_)));
     }
 
