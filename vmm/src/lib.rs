@@ -68,6 +68,7 @@ use crate::migration::transport::{
 };
 use crate::migration::worker::{
     MigrationSeccompFilters, MigrationWorker, MigrationWorkerHandle, MigrationWorkerResult,
+    SourceRecovery,
 };
 use crate::migration::{recv_vm_config, recv_vm_state};
 use crate::seccomp_filters::{Thread, get_seccomp_filter};
@@ -1659,6 +1660,7 @@ impl Vmm {
         send_data_migration: &VmSendMigrationData,
         initial_vm_state: VmState,
         seccomp_filters: &MigrationSeccompFilters,
+        source_recovery: &mut SourceRecovery,
     ) -> result::Result<(), MigratableError> {
         // State machine that is updated with more context as we progress.
         let mut ctx = OngoingMigrationContext::new();
@@ -1794,52 +1796,6 @@ impl Vmm {
             mem_send.cleanup_workers()?;
         }
 
-        // We release the locks early to enable locking them on the destination host.
-        // The VM is already stopped.
-        // Keep the locks held if the source VM must be preserved.
-        if !send_data_migration.preserve_source {
-            vm.release_disk_locks()
-                .map_err(|e| MigratableError::UnlockError(anyhow!("{e}")))?;
-        }
-
-        // For postcopy, serve faults before sending State so the destination
-        // can fault pages in during restore.
-        let postcopy_handles = if matches!(send_data_migration.memory_mode, MigrationMode::Postcopy)
-        {
-            let fault_streams = (0..migration_connections.get())
-                .map(|_| {
-                    transport::open_fault_connection(
-                        &send_data_migration.destination_url,
-                        send_data_migration.tls_dir.as_deref(),
-                    )
-                })
-                .collect::<result::Result<Vec<_>, _>>()?;
-            let guest_memory = vm.guest_memory();
-
-            let handles = fault_streams
-                .into_iter()
-                .enumerate()
-                .map(|(index, fault_stream)| {
-                    let seccomp_filters = seccomp_filters.clone();
-                    let guest_memory = guest_memory.clone();
-                    thread::Builder::new()
-                        .name(format!("uffd-send-{index}"))
-                        .spawn(move || {
-                            Self::serve_postcopy(
-                                &seccomp_filters.postcopy_server,
-                                fault_stream,
-                                guest_memory,
-                            )
-                        })
-                        .with_context(|| format!("spawning postcopy serve thread {index}"))
-                        .map_err(MigratableError::MigrateSend)
-                })
-                .collect::<result::Result<Vec<_>, _>>()?;
-            Some(handles)
-        } else {
-            None
-        };
-
         let (vm_snapshot, snapshot_duration) = measure_ok(|| {
             // Capture snapshot. This may have side effects, e.g. vhost-user backend inflight drain
             let snapshot = vm.snapshot()?;
@@ -1850,9 +1806,100 @@ impl Vmm {
             {
                 let memory_ranges = vm.dirty_log()?;
                 transport::send_memory_ranges(&vm.guest_memory(), &memory_ranges, &mut socket)?;
+                vm.stop_dirty_log()?;
             }
             Ok(snapshot)
         })?;
+
+        // For postcopy, serve faults before sending State so the destination
+        // can fault pages in during restore. Keep each worker behind a startup
+        // channel until every socket and thread has been created successfully.
+        let (postcopy_handles, postcopy_start_txs) = if matches!(
+            send_data_migration.memory_mode,
+            MigrationMode::Postcopy
+        ) {
+            let fault_streams = (0..migration_connections.get())
+                .map(|_| {
+                    transport::open_fault_connection(
+                        &send_data_migration.destination_url,
+                        send_data_migration.tls_dir.as_deref(),
+                    )
+                })
+                .collect::<result::Result<Vec<_>, _>>()?;
+            let guest_memory = vm.guest_memory();
+
+            let mut handles = Vec::with_capacity(fault_streams.len());
+            let mut start_txs = Vec::with_capacity(fault_streams.len());
+            for (index, fault_stream) in fault_streams.into_iter().enumerate() {
+                let seccomp_filters = seccomp_filters.clone();
+                let guest_memory = guest_memory.clone();
+                let (start_tx, start_rx) = channel();
+                let handle = thread::Builder::new()
+                    .name(format!("uffd-send-{index}"))
+                    .spawn(move || {
+                        if start_rx.recv().is_err() {
+                            return Ok(());
+                        }
+                        Self::serve_postcopy(
+                            &seccomp_filters.postcopy_server,
+                            fault_stream,
+                            guest_memory,
+                        )
+                    })
+                    .with_context(|| format!("spawning postcopy serve thread {index}"))
+                    .map_err(MigratableError::MigrateSend);
+
+                match handle {
+                    Ok(handle) => {
+                        handles.push(handle);
+                        start_txs.push(start_tx);
+                    }
+                    Err(error) => {
+                        drop(start_txs);
+                        for handle in handles {
+                            handle.join().ok();
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            (Some(handles), start_txs)
+        } else {
+            (None, Vec::new())
+        };
+
+        // Keep source disk locks until all local snapshot, memory-finalization,
+        // socket, and worker setup has succeeded. The destination does not
+        // acquire them until State.
+        if !send_data_migration.preserve_source {
+            // Releasing multiple disk locks can fail partway through. From
+            // this point onward ownership is ambiguous, so never resume the
+            // source automatically on error.
+            *source_recovery = SourceRecovery::LeaveStopped;
+            if let Err(error) = vm
+                .release_disk_locks()
+                .map_err(|e| MigratableError::UnlockError(anyhow!("{e}")))
+            {
+                drop(postcopy_start_txs);
+                if let Some(handles) = postcopy_handles {
+                    for handle in handles {
+                        handle.join().ok();
+                    }
+                }
+                return Err(error);
+            }
+        }
+
+        for start_tx in postcopy_start_txs {
+            start_tx
+                .send(())
+                .expect("postcopy serve thread must wait for its startup signal");
+        }
+
+        // State may be applied even if its acknowledgement is lost. From this
+        // protocol boundary onward, including preserve_source migrations, an
+        // automatic source resume could create two live VMs.
+        *source_recovery = SourceRecovery::LeaveStopped;
 
         let (_, send_snapshot_duration) =
             measure_ok(|| transport::send_state(&mut socket, &vm_snapshot))?;
@@ -1885,13 +1932,6 @@ impl Vmm {
             send_data_migration.downtime().as_millis()
         );
         debug!("Downtime breakdown: {}", ctx.downtime_ctx);
-
-        // Stop logging dirty pages
-        if !send_data_migration.local
-            && !matches!(send_data_migration.memory_mode, MigrationMode::Postcopy)
-        {
-            vm.stop_dirty_log()?;
-        }
 
         // Wait for the serve threads to drain every page.
         if let Some(handles) = postcopy_handles {
@@ -2146,6 +2186,7 @@ impl Vmm {
             migration_result: migration_res,
             initial_vm_state,
             preserve_source,
+            source_recovery,
         } = migration_worker_handle.join();
 
         let mut try_resume_vm_after_failed_migration = |mut vm: Vm| {
@@ -2189,12 +2230,36 @@ impl Vmm {
                     error!("Failed exiting the VMM after migration: {e}");
                 }
             }
-            Err(e) => {
+            Err(e) if source_recovery == SourceRecovery::Resume => {
                 error!(
                     "Migration failed: {}",
                     util::flatten_error_chain_to_string(&e)
                 );
                 try_resume_vm_after_failed_migration(vm);
+            }
+            Err(e) => {
+                error!(
+                    "Migration failed after destination handoff; leaving the source VM stopped: {}",
+                    util::flatten_error_chain_to_string(&e)
+                );
+
+                let mut vm = vm;
+                let _ = vm.stop_dirty_log().inspect_err(|stop_error| {
+                    warn!(
+                        "Failed stopping dirty log after migration failure: {stop_error} - VM performance might be slower than usual"
+                    );
+                });
+
+                if preserve_source {
+                    self.vm = VmOwnership::Owned(vm);
+                } else {
+                    if let Err(shutdown_error) = vm.shutdown() {
+                        error!("Failed shutting down the source VM: {shutdown_error}");
+                    }
+                    if let Err(exit_error) = self.exit_evt.write(1) {
+                        error!("Failed exiting the VMM after migration failure: {exit_error}");
+                    }
+                }
             }
         }
     }

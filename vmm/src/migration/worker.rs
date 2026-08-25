@@ -87,6 +87,16 @@ pub struct MigrationWorker {
     seccomp_filters: MigrationSeccompFilters,
 }
 
+/// Whether a failed migration may safely resume the source VM.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceRecovery {
+    /// The source still owns all resources needed to resume safely.
+    Resume,
+    /// Ownership may have crossed to the destination, so the source must stay
+    /// stopped to avoid two VMs using the same resources.
+    LeaveStopped,
+}
+
 impl MigrationWorker {
     /// Drives the migration from its start to its end (success, cancellation,
     /// failure)
@@ -102,6 +112,7 @@ impl MigrationWorker {
         };
 
         let mut vm = self.vm_receiver.recv().expect("VMM should send VM");
+        let mut source_recovery = SourceRecovery::Resume;
 
         // We can't propagate errors early because of the complex return type,
         // therefore we chain the results together.
@@ -115,6 +126,7 @@ impl MigrationWorker {
                     &self.config,
                     self.initial_vm_state,
                     &self.seccomp_filters,
+                    &mut source_recovery,
                 )
             })
             .inspect(|_| event!("vm", "migration-finished"))
@@ -128,6 +140,7 @@ impl MigrationWorker {
             migration_result,
             initial_vm_state: self.initial_vm_state,
             preserve_source: self.config.preserve_source,
+            source_recovery,
         }
     }
 
@@ -184,10 +197,14 @@ pub struct MigrationWorkerResult {
     /// If `migration_result` is `Ok`, the VM is paused and can be deleted
     /// unless `preserve_source` is true, which means the VM is given back
     /// to the VMM in a paused state.
-    /// If `Err`, the VM can be resumed and given back to the VMM.
+    /// If `Err`, [`Self::source_recovery`] determines whether the VM can be
+    /// resumed or must remain stopped.
     pub vm: Vm,
     /// The result of [`Vmm::send_migration`].
     pub migration_result: Result<(), MigratableError>,
     pub initial_vm_state: VmState,
     pub preserve_source: bool,
+    /// Whether an error occurred before resource ownership could cross to the
+    /// destination.
+    pub source_recovery: SourceRecovery,
 }
