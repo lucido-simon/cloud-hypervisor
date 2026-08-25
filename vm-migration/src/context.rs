@@ -359,6 +359,14 @@ impl MemoryMigrationContext {
         );
     }
 
+    /// Records the paused final-memory phase when it transfers metadata rather
+    /// than memory contents, as hybrid postcopy does for its dirty-page table.
+    pub fn record_final_iteration(&mut self, iteration_begin: Instant) {
+        self.iteration_begin = iteration_begin;
+        self.iteration_duration = Some(iteration_begin.elapsed());
+        self.transfer_duration = None;
+    }
+
     /// Finalizes the metrics.
     ///
     /// From now on, the metrics are considered finalized and should not be
@@ -657,6 +665,23 @@ mod tests {
             assert_eq!(ctx.migration_duration, None);
             ctx.finalize();
             assert!(matches!(ctx.migration_duration, Some(d) if d >= Scenario::FIXPOINT_PAST));
+        }
+
+        #[test]
+        fn metadata_final_iteration_replaces_transfer_timing() {
+            let s = Scenario::new();
+            let mut ctx = s.make_ctx();
+
+            ctx.update_metrics_before_transfer(s.iteration_begin, &make_table(1024));
+            ctx.update_metrics_after_transfer(s.transfer_begin, s.transfer_duration);
+            let sent_bytes = ctx.total_sent_bytes;
+
+            let metadata_begin = Instant::now() - Duration::from_millis(5);
+            ctx.record_final_iteration(metadata_begin);
+
+            assert!(ctx.iteration_duration.unwrap() >= Duration::from_millis(5));
+            assert_eq!(ctx.transfer_duration, None);
+            assert_eq!(ctx.total_sent_bytes, sent_bytes);
         }
 
         #[test]

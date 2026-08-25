@@ -587,6 +587,51 @@ impl MemoryRangeTable {
         self.data.push(range);
     }
 
+    /// Validate and canonicalize the table without applying guest-memory
+    /// specific alignment or containment rules.
+    ///
+    /// The neutral error type lets source and destination callers attach the
+    /// appropriate migration direction when propagating invalid tables.
+    pub fn normalize(mut self) -> anyhow::Result<Self> {
+        for range in &self.data {
+            if range.length == 0 {
+                return Err(anyhow!("Memory range at {:#x} has zero length", range.gpa));
+            }
+            range.gpa.checked_add(range.length).ok_or_else(|| {
+                anyhow!(
+                    "Memory range at {:#x} with length {:#x} overflows",
+                    range.gpa,
+                    range.length
+                )
+            })?;
+        }
+
+        self.data.sort_unstable_by_key(|range| range.gpa);
+
+        let mut normalized_len = 0;
+        for index in 0..self.data.len() {
+            let range = self.data[index];
+            if normalized_len == 0 {
+                self.data[normalized_len] = range;
+                normalized_len += 1;
+                continue;
+            }
+
+            let previous = self.data[normalized_len - 1];
+            let previous_end = previous.gpa + previous.length;
+            if range.gpa <= previous_end {
+                let range_end = range.gpa + range.length;
+                self.data[normalized_len - 1].length = previous_end.max(range_end) - previous.gpa;
+            } else {
+                self.data[normalized_len] = range;
+                normalized_len += 1;
+            }
+        }
+        self.data.truncate(normalized_len);
+
+        Ok(self)
+    }
+
     pub fn read_from(
         fd: &mut dyn Read,
         length: u64,
@@ -810,6 +855,111 @@ mod tests {
         let error =
             MemoryRangeTable::read_from(&mut cursor, oversized_length, usize::MAX).unwrap_err();
         assert!(matches!(error, MigratableError::MigrateReceive(_)));
+    }
+
+    #[test]
+    fn test_memory_range_table_normalize_empty() {
+        let table = MemoryRangeTable::default().normalize().unwrap();
+        assert!(table.is_empty());
+    }
+
+    #[test]
+    fn test_memory_range_table_normalize_sorts_ranges() {
+        let mut table = MemoryRangeTable::default();
+        table.push(MemoryRange {
+            gpa: 0x5000,
+            length: 0x1000,
+        });
+        table.push(MemoryRange {
+            gpa: 0x1000,
+            length: 0x1000,
+        });
+
+        let table = table.normalize().unwrap();
+        assert_eq!(
+            table.regions(),
+            &[
+                MemoryRange {
+                    gpa: 0x1000,
+                    length: 0x1000,
+                },
+                MemoryRange {
+                    gpa: 0x5000,
+                    length: 0x1000,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_memory_range_table_normalize_merges_overlapping_ranges() {
+        let mut table = MemoryRangeTable::default();
+        table.push(MemoryRange {
+            gpa: 0x1000,
+            length: 0x3000,
+        });
+        table.push(MemoryRange {
+            gpa: 0x2000,
+            length: 0x4000,
+        });
+
+        let table = table.normalize().unwrap();
+        assert_eq!(
+            table.regions(),
+            &[MemoryRange {
+                gpa: 0x1000,
+                length: 0x5000,
+            }]
+        );
+    }
+
+    #[test]
+    fn test_memory_range_table_normalize_merges_adjacent_ranges() {
+        let mut table = MemoryRangeTable::default();
+        table.push(MemoryRange {
+            gpa: 0x1000,
+            length: 0x2000,
+        });
+        table.push(MemoryRange {
+            gpa: 0x3000,
+            length: 0x1000,
+        });
+
+        let table = table.normalize().unwrap();
+        assert_eq!(
+            table.regions(),
+            &[MemoryRange {
+                gpa: 0x1000,
+                length: 0x3000,
+            }]
+        );
+    }
+
+    #[test]
+    fn test_memory_range_table_normalize_rejects_zero_length() {
+        let mut table = MemoryRangeTable::default();
+        table.push(MemoryRange {
+            gpa: 0x1000,
+            length: 0,
+        });
+
+        let error = table.normalize().unwrap_err();
+        assert_eq!(error.to_string(), "Memory range at 0x1000 has zero length");
+    }
+
+    #[test]
+    fn test_memory_range_table_normalize_rejects_overflow() {
+        let mut table = MemoryRangeTable::default();
+        table.push(MemoryRange {
+            gpa: u64::MAX,
+            length: 1,
+        });
+
+        let error = table.normalize().unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Memory range at 0xffffffffffffffff with length 0x1 overflows"
+        );
     }
 
     #[test]

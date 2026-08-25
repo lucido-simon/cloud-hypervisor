@@ -1234,6 +1234,23 @@ pub(crate) fn send_state(
     )
 }
 
+/// Send the table of ranges dirtied during the full postcopy precopy pass.
+///
+/// Unlike [`send_memory_ranges`], this sends only the range table and no guest
+/// memory contents. Empty tables are sent because the request is also the
+/// protocol phase barrier before postcopy begins.
+pub(crate) fn send_postcopy_dirty_ranges(
+    ranges: &MemoryRangeTable,
+    socket: &mut SocketStream,
+) -> Result<(), MigratableError> {
+    Request::postcopy_dirty(ranges.length()).write_to(socket)?;
+    ranges.write_to(socket)?;
+    expect_ok_response(
+        socket,
+        MigratableError::MigrateSend(anyhow!("Error during postcopy dirty range migration")),
+    )
+}
+
 /// Transmits the given [`MemoryRangeTable`] and the corresponding guest memory
 /// content over the wire if there is at least one range.
 ///
@@ -1372,14 +1389,17 @@ mod tests {
     use std::mem::size_of;
     use std::os::unix::net::UnixStream;
     use std::sync::mpsc::channel;
+    use std::thread;
 
     use vm_memory::{GuestAddress, GuestMemoryAtomic, GuestMemoryMmap};
     use vm_migration::MigratableError;
-    use vm_migration::protocol::{ConnectionRole, MemoryRange, Request};
+    use vm_migration::protocol::{
+        Command, ConnectionRole, MemoryRange, MemoryRangeTable, Request, Response,
+    };
 
     use super::{
         MAX_MIGRATION_CONNECTIONS, ReceiveAdditionalConnections, SocketStream,
-        receive_postcopy_dirty_ranges, tcp_address_to_server_name,
+        receive_postcopy_dirty_ranges, send_postcopy_dirty_ranges, tcp_address_to_server_name,
     };
 
     fn socket_with_role(role: ConnectionRole) -> SocketStream {
@@ -1429,6 +1449,39 @@ mod tests {
         .err()
         .expect("A fault connection beyond its negotiated limit must fail");
         assert!(matches!(error, MigratableError::MigrateReceive(_)));
+    }
+
+    #[test]
+    fn test_postcopy_dirty_ranges_roundtrip() {
+        let mut nonempty_table = MemoryRangeTable::default();
+        nonempty_table.push(MemoryRange {
+            gpa: 0x1000,
+            length: 0x2000,
+        });
+
+        for table in [MemoryRangeTable::default(), nonempty_table] {
+            let expected_ranges = table.regions().to_vec();
+            let (sender, receiver) = UnixStream::pair().unwrap();
+            let receiver = thread::spawn(move || {
+                let mut socket = SocketStream::Unix(receiver);
+                let request = Request::read_from(&mut socket).unwrap();
+                assert_eq!(request.command(), Command::PostcopyDirty);
+                let guest_memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x4000)])
+                    .map(GuestMemoryAtomic::new)
+                    .unwrap();
+                let table =
+                    receive_postcopy_dirty_ranges(&guest_memory, &request, &mut socket).unwrap();
+                Response::ok().write_to(&mut socket).unwrap();
+                table.regions().to_vec()
+            });
+
+            let mut socket = SocketStream::Unix(sender);
+            send_postcopy_dirty_ranges(&table, &mut socket).unwrap();
+            assert_eq!(
+                receiver.join().expect("Receiver thread panicked"),
+                expected_ranges
+            );
+        }
     }
 
     #[test]

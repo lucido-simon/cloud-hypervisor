@@ -7266,9 +7266,9 @@ mod common_parallel {
         handle_child_output(r, &dest_output);
     }
 
-    // Postcopy live migration. Verifies the destination boots a guest
-    // that touches all of its memory, which forces every page to be
-    // demand-faulted across the network.
+    // Postcopy live migration. Verifies that a full precopy pass preserves
+    // clean guest data while an active workload produces a non-empty dirty
+    // set whose complete byte budget is served through postcopy.
     fn _test_live_migration_tcp_postcopy(
         connections: Option<NonZeroU32>,
         expected_connections: NonZeroU32,
@@ -7285,6 +7285,8 @@ mod common_parallel {
         let memory_param: &[&str] = &["--memory", "size=512M"];
         let boot_vcpus = 2;
 
+        let dest_event_path = temp_event_monitor_path(&guest.tmp_dir);
+        let src_event_path = format!("{dest_event_path}.src");
         let src_vm_path = clh_command("cloud-hypervisor");
         let src_api_socket = temp_api_path(&guest.tmp_dir);
         let mut src_child = GuestCommand::new_with_binary_path(&guest, &src_vm_path)
@@ -7295,11 +7297,11 @@ mod common_parallel {
             .default_disks()
             .args(["--net", net_params.as_str()])
             .args(["--api-socket", &src_api_socket])
+            .args(["--event-monitor", format!("path={src_event_path}").as_str()])
             .capture_output()
             .spawn()
             .unwrap();
 
-        let dest_event_path = temp_event_monitor_path(&guest.tmp_dir);
         let mut dest_api_socket = temp_api_path(&guest.tmp_dir);
         dest_api_socket.push_str(".dest");
         let mut dest_child = GuestCommand::new(&guest)
@@ -7318,6 +7320,22 @@ mod common_parallel {
             assert!(guest.get_total_memory().unwrap_or_default() > 400_000);
             guest.check_devices_common(None, Some(&console_text), None);
 
+            guest
+                .ssh_command(
+                    "dd if=/dev/urandom of=/dev/shm/postcopy-sentinel bs=1M count=8 status=none",
+                )
+                .unwrap();
+            let checksum = guest
+                .ssh_command("sha256sum /dev/shm/postcopy-sentinel | cut -d' ' -f1")
+                .unwrap();
+            guest
+                .ssh_command(
+                    "nohup stress --vm 1 --vm-bytes 64M --vm-keep --timeout 120 \
+                     >/dev/null 2>&1 &",
+                )
+                .unwrap();
+            thread::sleep(Duration::from_secs(1));
+
             #[cfg(target_arch = "x86_64")]
             guest.add_test_disk(&src_api_socket);
 
@@ -7331,15 +7349,18 @@ mod common_parallel {
                 ),
                 "Postcopy live migration command failed."
             );
+
+            checksum
         });
-        if r.is_err() {
-            print_and_panic(
+        let expected_checksum = match r {
+            Ok(checksum) => checksum,
+            Err(_) => print_and_panic(
                 src_child,
                 dest_child,
                 None,
                 "Error occurred during postcopy live-migration",
-            );
-        }
+            ),
+        };
 
         let src_exited_ok = wait_until(Duration::from_secs(60), || {
             matches!(src_child.try_wait(), Ok(Some(_)))
@@ -7354,12 +7375,79 @@ mod common_parallel {
         }
 
         let r = panic::catch_unwind(|| {
+            let expected_events = [
+                &MetaEvent {
+                    event: "migration-started".to_string(),
+                    device_id: None,
+                },
+                &MetaEvent {
+                    event: "migration-memory-iteration".to_string(),
+                    device_id: None,
+                },
+                &MetaEvent {
+                    event: "postcopy-dirty-pages".to_string(),
+                    device_id: None,
+                },
+                &MetaEvent {
+                    event: "postcopy-migration-completed".to_string(),
+                    device_id: None,
+                },
+                &MetaEvent {
+                    event: "migration-finished".to_string(),
+                    device_id: None,
+                },
+            ];
+            assert!(wait_for_sequential_events(
+                Duration::from_secs(30),
+                &expected_events,
+                &src_event_path,
+            ));
+            let source_events = fs::read_to_string(&src_event_path).unwrap();
+            let memory_iterations: Vec<serde_json::Value> = source_events
+                .trim()
+                .split("\n\n")
+                .map(|event| serde_json::from_str(event).unwrap())
+                .filter(|event: &serde_json::Value| event["event"] == "migration-memory-iteration")
+                .collect();
+            assert_eq!(
+                memory_iterations.len(),
+                1,
+                "Postcopy should perform exactly one precopy memory iteration"
+            );
+            assert_eq!(
+                memory_iterations[0]["properties"]["bytes"].as_str(),
+                Some("536870912"),
+                "Postcopy should precopy the complete guest RAM"
+            );
+
+            let dirty_bytes = source_events
+                .trim()
+                .split("\n\n")
+                .map(|event| serde_json::from_str::<serde_json::Value>(event).unwrap())
+                .find(|event| event["event"] == "postcopy-dirty-pages")
+                .and_then(|event| {
+                    event["properties"]["bytes"]
+                        .as_str()
+                        .and_then(|bytes| bytes.parse::<u64>().ok())
+                })
+                .expect("Missing postcopy dirty-byte count");
+            assert!(dirty_bytes > 0, "The active workload should dirty memory");
+
             // Probing the destination forces page faults across most of
             // guest memory. If the source serve loop drops bytes, these
             // checks fail.
             assert_eq!(guest.get_cpu_count().unwrap_or_default(), boot_vcpus);
             assert!(guest.get_total_memory().unwrap_or_default() > 400_000);
             guest.check_devices_common(None, Some(&console_text), None);
+            let _ = guest.ssh_command("pkill -f 'stress --vm'");
+            assert_eq!(
+                guest
+                    .ssh_command("sha256sum /dev/shm/postcopy-sentinel | cut -d' ' -f1")
+                    .unwrap()
+                    .trim(),
+                expected_checksum.trim(),
+                "Guest-memory sentinel changed during postcopy migration"
+            );
 
             #[cfg(target_arch = "x86_64")]
             guest.remove_test_disk(&dest_api_socket);

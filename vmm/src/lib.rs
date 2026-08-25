@@ -1610,8 +1610,8 @@ impl Vmm {
     }
 
     /// Performs the initial memory transmission (iteration zero) plus a
-    /// variable number of memory iterations with the goal to eventually migrate
-    /// the VM in a reasonably small downtime.
+    /// variable number of memory iterations with the goal to eventually
+    /// migrate the VM in a reasonably small downtime.
     ///
     /// This returns as soon as the precopy migration indicates it is converged
     /// (e.g., reasonably small downtime) is reached.
@@ -1619,6 +1619,7 @@ impl Vmm {
         vm: &mut Vm,
         socket: &mut SocketStream,
         ctx: &mut MemoryMigrationContext,
+        initial_memory_policy: MemoryRangePolicy,
         is_converged: impl Fn(&MemoryMigrationContext) -> result::Result<bool, MigratableError>,
         mem_send: &mut SendAdditionalConnections,
     ) -> result::Result<MemoryRangeTable /* remaining */, MigratableError> {
@@ -1626,7 +1627,7 @@ impl Vmm {
             let iteration_begin = Instant::now();
 
             let iteration_table = if ctx.iteration == 0 {
-                vm.memory_range_table(MemoryRangePolicy::Sparse)?
+                vm.memory_range_table(initial_memory_policy)?
             } else {
                 // TODO do this in a thread #7816
                 vm.dirty_log()?
@@ -1652,7 +1653,9 @@ impl Vmm {
                 "vm",
                 "migration-memory-iteration",
                 "id",
-                ctx.iteration.to_string()
+                ctx.iteration.to_string(),
+                "bytes",
+                ctx.current_iteration_total_bytes.to_string()
             );
 
             // Increment iteration last: This way we ensure that the logging
@@ -1775,7 +1778,7 @@ impl Vmm {
             vm,
             socket,
             &mut mem_ctx,
-            // We bind send_data_migration to the callback
+            MemoryRangePolicy::Sparse,
             |ctx| Self::is_precopy_converged(ctx, send_data_migration),
             mem_send,
         )?;
@@ -1804,6 +1807,57 @@ impl Vmm {
             .expect("migration context should transition to VmPaused after memory migration");
 
         Ok(())
+    }
+
+    /// Copies all guest RAM once while the VM runs, then returns every page
+    /// dirtied before or during the pause. The returned pages are deliberately
+    /// not copied again: the destination invalidates and resolves them through
+    /// the existing postcopy fault path.
+    fn do_postcopy_preload(
+        vm: &mut Vm,
+        socket: &mut SocketStream,
+        mem_send: &mut SendAdditionalConnections,
+        send_data_migration: &VmSendMigrationData,
+    ) -> result::Result<(Instant, MemoryMigrationContext, MemoryRangeTable), MigratableError> {
+        let mut mem_ctx = MemoryMigrationContext::new();
+
+        vm.start_dirty_log()?;
+        let remaining = Self::do_memory_iterations(
+            vm,
+            socket,
+            &mut mem_ctx,
+            MemoryRangePolicy::Full,
+            // Stop after the complete initial transfer. The next loop has
+            // already sampled the dirties accumulated during that transfer.
+            |ctx| {
+                if ctx.iteration == 0 {
+                    return Ok(false);
+                }
+                if ctx.migration_begin.elapsed() >= send_data_migration.timeout()
+                    && matches!(
+                        send_data_migration.timeout_strategy,
+                        TimeoutStrategy::Cancel
+                    )
+                {
+                    return Err(MigratableError::MigrateSend(anyhow!(
+                        "Postcopy preload exceeded the migration timeout of {}s",
+                        send_data_migration.timeout().as_secs()
+                    )));
+                }
+                Ok(true)
+            },
+            mem_send,
+        )?;
+
+        let downtime_begin = Instant::now();
+        if vm.get_state() != VmState::Paused {
+            vm.pause()?;
+        }
+
+        let mut dirty_ranges = vm.dirty_log()?;
+        dirty_ranges.extend(remaining);
+
+        Ok((downtime_begin, mem_ctx, dirty_ranges))
     }
 
     /// Performs a migration.
@@ -1839,6 +1893,12 @@ impl Vmm {
         // Send config
         let vm_config = vm.get_config();
         let migration_connections = send_data_migration.connections;
+        let postcopy = matches!(send_data_migration.memory_mode, MigrationMode::Postcopy);
+        // Local/offload postcopy shares backing memory with the receiver and
+        // keeps the existing all-pages-on-demand flow. Hybrid preload is for
+        // network live migration, where the destination owns a private copy.
+        let postcopy_preload = postcopy && !send_data_migration.local;
+        let dirty_log_enabled = !send_data_migration.local && (!postcopy || postcopy_preload);
         debug!(
             "Using {} migration connection(s)",
             migration_connections.get()
@@ -1899,12 +1959,8 @@ impl Vmm {
             common_cpuid,
             memory_manager_data: vm.memory_manager_data(),
             memory_mode: send_data_migration.memory_mode,
-            postcopy_connections: matches!(
-                send_data_migration.memory_mode,
-                MigrationMode::Postcopy
-            )
-            .then_some(migration_connections),
-            postcopy_preload: false,
+            postcopy_connections: postcopy.then_some(migration_connections),
+            postcopy_preload,
         };
         transport::send_config(&mut socket, &vm_migration_config)?;
 
@@ -1914,9 +1970,8 @@ impl Vmm {
             vm.start_migration()?;
         }
 
-        if send_data_migration.local
-            || matches!(send_data_migration.memory_mode, MigrationMode::Postcopy)
-        {
+        let mut postcopy_preload_state = None;
+        if send_data_migration.local {
             // Now pause VM (skip if already paused, e.g. migrating a paused VM)
             let downtime_begin = Instant::now();
             if vm.get_state() != VmState::Paused {
@@ -1927,7 +1982,7 @@ impl Vmm {
                 // No memory was transferred
                 MemoryMigrationContext::empty_finalized(),
             )
-            .expect("migration context should transition to VmPaused for local/postcopy migration");
+            .expect("migration context should transition to VmPaused without a precopy pass");
         } else {
             let mut mem_send = transport::SendAdditionalConnections::new(
                 &send_data_migration.destination_url,
@@ -1937,14 +1992,26 @@ impl Vmm {
                 &seccomp_filters.tcp_worker,
             )?;
 
-            Self::do_memory_migration(
-                vm,
-                &mut socket,
-                send_data_migration,
-                &mut mem_send,
-                &mut ctx,
-            )
-            .inspect_err(|_| {
+            let memory_result = if postcopy_preload {
+                info!("Postcopy: starting a full precopy memory pass");
+                Self::do_postcopy_preload(vm, &mut socket, &mut mem_send, send_data_migration).map(
+                    |state| {
+                        postcopy_preload_state = Some(state);
+                    },
+                )
+            } else {
+                Self::do_memory_migration(
+                    vm,
+                    &mut socket,
+                    send_data_migration,
+                    &mut mem_send,
+                    &mut ctx,
+                )
+            };
+
+            memory_result.inspect_err(|_| {
+                // Calling cleanup multiple times is fine, thus here we just make sure
+                // that it is called.
                 if let Err(e) = mem_send.cleanup_workers() {
                     let msg = flatten_error_chain_to_string(&e);
                     warn!("Error cleaning up migration connections: {msg}");
@@ -1959,9 +2026,10 @@ impl Vmm {
             let snapshot = vm.snapshot()?;
 
             // One final memory iteration to handle side effects from snapshot.
-            if !send_data_migration.local
-                && !matches!(send_data_migration.memory_mode, MigrationMode::Postcopy)
-            {
+            if let Some((_, _, dirty_ranges)) = postcopy_preload_state.as_mut() {
+                dirty_ranges.extend(vm.dirty_log()?);
+                vm.stop_dirty_log()?;
+            } else if dirty_log_enabled {
                 let memory_ranges = vm.dirty_log()?;
                 transport::send_memory_ranges(&vm.guest_memory(), &memory_ranges, &mut socket)?;
                 vm.stop_dirty_log()?;
@@ -1969,60 +2037,87 @@ impl Vmm {
             Ok(snapshot)
         })?;
 
+        let expected_postcopy_bytes =
+            if let Some((downtime_begin, mut mem_ctx, dirty_ranges)) = postcopy_preload_state {
+                let dirty_handoff_begin = Instant::now();
+                let dirty_ranges = dirty_ranges
+                    .normalize()
+                    .context("Error normalizing postcopy dirty ranges")
+                    .map_err(MigratableError::MigrateSend)?;
+                let dirty_bytes = dirty_ranges.effective_size();
+                transport::send_postcopy_dirty_ranges(&dirty_ranges, &mut socket)?;
+                mem_ctx.record_final_iteration(dirty_handoff_begin);
+                mem_ctx.finalize();
+                info!("Postcopy preload complete: {mem_ctx}; {dirty_bytes} dirty bytes deferred");
+                event!(
+                    "vm",
+                    "postcopy-dirty-pages",
+                    "bytes",
+                    dirty_bytes.to_string()
+                );
+                ctx.set_vm_paused(downtime_begin, mem_ctx)
+                    .expect("migration context should transition after postcopy preload");
+                Some(dirty_bytes)
+            } else {
+                None
+            };
+        let postcopy_faults_needed = expected_postcopy_bytes.map_or(postcopy, |bytes| bytes != 0);
+
         // For postcopy, serve faults before sending State so the destination
         // can fault pages in during restore. Keep each worker behind a startup
         // channel until every socket and thread has been created successfully.
-        let (postcopy_handles, postcopy_start_txs) =
-            if matches!(send_data_migration.memory_mode, MigrationMode::Postcopy) {
-                let fault_streams = (0..migration_connections.get())
-                    .map(|_| {
-                        transport::open_fault_connection(
-                            &send_data_migration.destination_url,
-                            send_data_migration.tls_dir.as_deref(),
+        let (postcopy_handles, postcopy_start_txs) = if postcopy_faults_needed {
+            let fault_streams = (0..migration_connections.get())
+                .map(|_| {
+                    transport::open_fault_connection(
+                        &send_data_migration.destination_url,
+                        send_data_migration.tls_dir.as_deref(),
+                    )
+                })
+                .collect::<result::Result<Vec<_>, _>>()?;
+            let guest_memory = vm.guest_memory();
+
+            let mut handles = Vec::with_capacity(fault_streams.len());
+            let mut start_txs = Vec::with_capacity(fault_streams.len());
+            for (index, fault_stream) in fault_streams.into_iter().enumerate() {
+                let seccomp_filters = seccomp_filters.clone();
+                let guest_memory = guest_memory.clone();
+                let (start_tx, start_rx) = channel();
+                let handle = thread::Builder::new()
+                    .name(format!("uffd-send-{index}"))
+                    .spawn(move || {
+                        if start_rx.recv().is_err() {
+                            return Ok(());
+                        }
+                        Self::serve_postcopy(
+                            &seccomp_filters.postcopy_server,
+                            fault_stream,
+                            guest_memory,
                         )
                     })
-                    .collect::<result::Result<Vec<_>, _>>()?;
-                let guest_memory = vm.guest_memory();
+                    .with_context(|| format!("spawning postcopy serve thread {index}"))
+                    .map_err(MigratableError::MigrateSend);
 
-                let mut handles = Vec::with_capacity(fault_streams.len());
-                let mut start_txs = Vec::with_capacity(fault_streams.len());
-                for (index, fault_stream) in fault_streams.into_iter().enumerate() {
-                    let seccomp_filters = seccomp_filters.clone();
-                    let guest_memory = guest_memory.clone();
-                    let (start_tx, start_rx) = channel();
-                    let handle = thread::Builder::new()
-                        .name(format!("uffd-send-{index}"))
-                        .spawn(move || {
-                            if start_rx.recv().is_err() {
-                                return Ok(());
-                            }
-                            Self::serve_postcopy(
-                                &seccomp_filters.postcopy_server,
-                                fault_stream,
-                                guest_memory,
-                            )
-                        })
-                        .with_context(|| format!("spawning postcopy serve thread {index}"))
-                        .map_err(MigratableError::MigrateSend);
-
-                    match handle {
-                        Ok(handle) => {
-                            handles.push(handle);
-                            start_txs.push(start_tx);
+                match handle {
+                    Ok(handle) => {
+                        handles.push(handle);
+                        start_txs.push(start_tx);
+                    }
+                    Err(error) => {
+                        drop(start_txs);
+                        for handle in handles {
+                            handle.join().ok();
                         }
-                        Err(error) => {
-                            drop(start_txs);
-                            for handle in handles {
-                                handle.join().ok();
-                            }
-                            return Err(error);
-                        }
+                        return Err(error);
                     }
                 }
-                (Some(handles), start_txs)
-            } else {
-                (None, Vec::new())
-            };
+            }
+            (Some(handles), start_txs)
+        } else if postcopy {
+            (Some(Vec::new()), Vec::new())
+        } else {
+            (None, Vec::new())
+        };
 
         // Keep source disk locks until all local snapshot, memory-finalization,
         // socket, and worker setup has succeeded. The destination does not
@@ -3631,6 +3726,24 @@ impl RequestHandler for Vmm {
             .validate()
             .context("Invalid send migration configuration")
             .map_err(MigratableError::MigrateSend)?;
+
+        let postcopy_preload_supported = {
+            let config = self
+                .vm_config
+                .as_ref()
+                .expect("a running VM must have a configuration")
+                .lock()
+                .unwrap();
+            supports_postcopy_preload(&config)
+        };
+        if !send_data_migration.local
+            && matches!(send_data_migration.memory_mode, MigrationMode::Postcopy)
+            && !postcopy_preload_supported
+        {
+            return Err(MigratableError::MigrateSend(anyhow!(
+                "Postcopy migration requires private anonymous memory without balloon, virtio-mem, or pvmemcontrol"
+            )));
+        }
 
         info!(
             "Sending migration: destination_url={},local={},tls={},downtime={}ms,timeout={}s,timeout_strategy={:?}",

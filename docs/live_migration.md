@@ -388,8 +388,15 @@ migration process. Via the API or `ch-remote`, you may specify:
   one shared byte of tracking state per backing page, independent of the
   connection count (about 256 MiB per TiB of guest RAM with 4 KiB pages).
 - `memory_mode <precopy|postcopy>`: \
-  Memory transfer mode. `postcopy` resumes the destination first and faults
-  guest pages in on demand over one or more dedicated connections. Defaults to
+  Memory transfer mode. For non-local live migration with private anonymous
+  RAM, `postcopy` first sends a complete memory image while the source runs.
+  After pausing, it sends the final dirty-page set; the destination retains
+  clean pages, discards stale pages, and fetches only those pages over the
+  dedicated fault connections. Shared, explicit hugetlb, file-backed,
+  balloon, virtio-mem, and pvmemcontrol configurations are currently rejected
+  for this flow because they can expose memory outside the registered UFFD
+  mapping or discard a page again while postcopy is active. On-demand offload
+  restore retains its shared-memory all-pages-on-demand behavior. Defaults to
   `precopy`.
 - `zone_updates <list of zone updates>`: \
   A list of updates to apply to memory zones on the receiver side. For example,
