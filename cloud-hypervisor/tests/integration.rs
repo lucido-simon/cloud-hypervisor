@@ -7431,7 +7431,22 @@ mod common_parallel {
                         .and_then(|bytes| bytes.parse::<u64>().ok())
                 })
                 .expect("Missing postcopy dirty-byte count");
+            let served_bytes = source_events
+                .trim()
+                .split("\n\n")
+                .map(|event| serde_json::from_str::<serde_json::Value>(event).unwrap())
+                .find(|event| event["event"] == "postcopy-migration-completed")
+                .and_then(|event| {
+                    event["properties"]["bytes"]
+                        .as_str()
+                        .and_then(|bytes| bytes.parse::<u64>().ok())
+                })
+                .expect("Missing postcopy served-byte count");
             assert!(dirty_bytes > 0, "The active workload should dirty memory");
+            assert_eq!(
+                served_bytes, dirty_bytes,
+                "Postcopy must serve exactly the deferred dirty-byte budget"
+            );
 
             // Probing the destination forces page faults across most of
             // guest memory. If the source serve loop drops bytes, these

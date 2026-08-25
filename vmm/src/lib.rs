@@ -2087,7 +2087,7 @@ impl Vmm {
                     .name(format!("uffd-send-{index}"))
                     .spawn(move || {
                         if start_rx.recv().is_err() {
-                            return Ok(());
+                            return Ok(0);
                         }
                         Self::serve_postcopy(
                             &seccomp_filters.postcopy_server,
@@ -2187,23 +2187,44 @@ impl Vmm {
         // Wait for the serve threads to drain every page.
         if let Some(handles) = postcopy_handles {
             let mut first_error = None;
+            let mut served_bytes = 0u64;
             for (index, handle) in handles.into_iter().enumerate() {
                 let result = handle.join().map_err(|e| {
                     MigratableError::MigrateSend(anyhow!(
                         "postcopy serve thread {index} panicked: {e:?}"
                     ))
                 });
-                if let Err(e) = result.and_then(|result| result)
-                    && first_error.is_none()
-                {
-                    first_error = Some(e);
+                match result.and_then(|result| result) {
+                    Ok(bytes) => {
+                        if let Some(total) = served_bytes.checked_add(bytes) {
+                            served_bytes = total;
+                        } else if first_error.is_none() {
+                            first_error = Some(MigratableError::MigrateSend(anyhow!(
+                                "Postcopy served-byte counter overflow"
+                            )));
+                        }
+                    }
+                    Err(e) if first_error.is_none() => first_error = Some(e),
+                    Err(_) => {}
                 }
             }
             if let Some(e) = first_error {
                 return Err(e);
             }
+            if let Some(expected_bytes) = expected_postcopy_bytes
+                && served_bytes != expected_bytes
+            {
+                return Err(MigratableError::MigrateSend(anyhow!(
+                    "Postcopy served {served_bytes} bytes, expected {expected_bytes} deferred dirty bytes"
+                )));
+            }
             // Signal that postcopy has drained every page to the destination.
-            event!("vm", "postcopy-migration-completed");
+            event!(
+                "vm",
+                "postcopy-migration-completed",
+                "bytes",
+                served_bytes.to_string()
+            );
         }
 
         // Let every Migratable object know about the migration being complete
@@ -2225,7 +2246,7 @@ impl Vmm {
         seccomp_filter: &BpfProgram,
         mut socket: SocketStream,
         guest_memory: GuestMemoryAtomic<GuestMemoryMmap>,
-    ) -> result::Result<(), MigratableError> {
+    ) -> result::Result<u64, MigratableError> {
         // Apply the dedicated seccomp filter for this thread. It is empty when
         // seccomp is disabled (SeccompAction::Allow), in which case there is
         // nothing to apply.
@@ -2236,6 +2257,7 @@ impl Vmm {
         }
 
         let mut buf: Vec<u8> = Vec::new();
+        let mut served_bytes = 0u64;
         info!("Postcopy: source entering PageFault serve loop");
 
         loop {
@@ -2248,7 +2270,7 @@ impl Vmm {
                     ) =>
                 {
                     info!("Postcopy: destination closed the fault connection — drain complete");
-                    return Ok(());
+                    return Ok(served_bytes);
                 }
                 Err(e) => return Err(e),
             };
@@ -2277,11 +2299,16 @@ impl Vmm {
                     socket
                         .write_all(&buf[..len])
                         .map_err(MigratableError::MigrateSocket)?;
+                    served_bytes = served_bytes.checked_add(range.length).ok_or_else(|| {
+                        MigratableError::MigrateSend(anyhow!(
+                            "Postcopy served-byte counter overflow"
+                        ))
+                    })?;
                 }
                 Command::Abandon => {
                     Response::ok().write_to(&mut socket)?;
                     info!("Postcopy: received Abandon, exiting serve loop");
-                    return Ok(());
+                    return Ok(served_bytes);
                 }
                 c => {
                     return Err(MigratableError::MigrateSend(anyhow!(
