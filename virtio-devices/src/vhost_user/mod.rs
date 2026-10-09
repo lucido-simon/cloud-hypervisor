@@ -47,7 +47,7 @@ pub use self::blk::Blk;
 pub use self::fs::*;
 pub use self::generic_vhost_user::GenericVhostUser;
 pub use self::net::Net;
-pub use self::vu_common_ctrl::VhostUserConfig;
+pub use self::vu_common_ctrl::{VhostUserBackend, VhostUserConfig};
 
 #[derive(Error, Debug)]
 pub enum Error {

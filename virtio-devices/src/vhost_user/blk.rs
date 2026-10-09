@@ -24,11 +24,11 @@ use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottabl
 use vmm_sys_util::eventfd::EventFd;
 
 use super::super::{ActivateResult, VirtioCommon, VirtioDevice, VirtioDeviceType};
-use super::vu_common_ctrl::{VhostUserConfig, VhostUserHandle};
+use super::vu_common_ctrl::VhostUserHandle;
 use super::{DEFAULT_VIRTIO_FEATURES, Error, Result};
 use crate::device::ActivationContext;
 use crate::seccomp_filters::Thread;
-use crate::vhost_user::{VhostUserCommon, VhostUserState};
+use crate::vhost_user::{VhostUserBackend, VhostUserCommon, VhostUserState};
 use crate::{GuestRegionMmap, VIRTIO_F_ACCESS_PLATFORM, VirtioInterrupt, VirtioInterruptType};
 
 const DEFAULT_QUEUE_NUMBER: usize = 1;
@@ -94,23 +94,15 @@ impl Blk {
     /// Create a new vhost-user-blk device
     pub fn new(
         id: String,
-        vu_cfg: VhostUserConfig,
+        backend: VhostUserBackend,
         queue_size: u16,
         seccomp_action: SeccompAction,
         exit_evt: EventFd,
         access_platform_enabled: bool,
         state: Option<State>,
     ) -> Result<Blk> {
-        let num_queues = vu_cfg.num_queues;
-
-        let mut vu = VhostUserHandle::connect_vhost_user(
-            false,
-            &vu_cfg.socket,
-            num_queues as u64,
-            false,
-            &exit_evt,
-            |_| Ok(()),
-        )?;
+        let num_queues = backend.cfg.num_queues;
+        let mut vu = backend.vu;
 
         let (
             avail_features,
@@ -216,7 +208,7 @@ impl Blk {
                 },
                 vu: Some(Arc::new(Mutex::new(vu))),
                 acked_protocol_features,
-                socket_path: vu_cfg.socket,
+                socket_path: backend.cfg.socket,
                 vu_num_queues,
                 vring_bases,
                 ..Default::default()

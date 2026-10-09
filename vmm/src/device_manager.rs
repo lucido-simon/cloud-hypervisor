@@ -117,7 +117,7 @@ use virtio_devices::transport::{
     VIRTIO_CONFIG_BAR_INDEX, VIRTIO_SHM_BAR_INDEX, VirtioPciDevice, VirtioPciDeviceActivator,
     VirtioTransport,
 };
-use virtio_devices::vhost_user::VhostUserConfig;
+use virtio_devices::vhost_user::{VhostUserBackend, VhostUserConfig};
 use virtio_devices::{
     AccessPlatformMapping, Block, Endpoint, IommuMapping, VdpaDmaMapping, VirtioMemMappingSource,
     balloon, mem, net, transport, vdpa, vhost_user, vsock,
@@ -2738,10 +2738,12 @@ impl DeviceManager {
                 num_queues: disk_cfg.num_queues,
                 server: false,
             };
+            let vu = VhostUserBackend::connect(vu_cfg, &self.exit_evt)
+                .map_err(DeviceManagerError::CreateVhostUserBlk)?;
             let vhost_user_block = Arc::new(Mutex::new(
                 match vhost_user::Blk::new(
                     id.clone(),
-                    vu_cfg,
+                    vu,
                     disk_cfg.queue_size,
                     self.seccomp_action.clone(),
                     self.exit_evt
@@ -2941,12 +2943,14 @@ impl DeviceManager {
                 num_queues: net_cfg.num_queues,
                 server,
             };
+            let vu = VhostUserBackend::connect(vu_cfg, &self.exit_evt)
+                .map_err(DeviceManagerError::CreateVhostUserNet)?;
             let vhost_user_net = Arc::new(Mutex::new(
                 match vhost_user::Net::new(
                     id.clone(),
+                    vu,
                     &mut net_cfg.mac,
                     net_cfg.mtu,
-                    vu_cfg,
                     net_cfg.queue_size,
                     self.seccomp_action.clone(),
                     self.exit_evt
@@ -3207,10 +3211,12 @@ impl DeviceManager {
                 num_queues: generic_vhost_user_cfg.queue_sizes.len(),
                 server: false,
             };
+            let vu = VhostUserBackend::connect(vu_cfg, &self.exit_evt)
+                .map_err(DeviceManagerError::CreateGenericVhostUser)?;
             let generic_vhost_user_device = Arc::new(Mutex::new(
                 vhost_user::GenericVhostUser::new(
                     id.clone(),
-                    vu_cfg,
+                    vu,
                     generic_vhost_user_cfg.queue_sizes.clone(),
                     generic_vhost_user_cfg.device_type,
                     None,
@@ -3282,10 +3288,12 @@ impl DeviceManager {
                 num_queues: vhost_user::fs::NUM_QUEUE_OFFSET + fs_cfg.num_queues,
                 server: false,
             };
+            let vu = VhostUserBackend::connect(vu_cfg, &self.exit_evt)
+                .map_err(DeviceManagerError::CreateVirtioFs)?;
             let virtio_fs_device = Arc::new(Mutex::new(
                 vhost_user::Fs::new(
                     id.clone(),
-                    vu_cfg,
+                    vu,
                     &fs_cfg.tag,
                     fs_cfg.queue_size,
                     None,

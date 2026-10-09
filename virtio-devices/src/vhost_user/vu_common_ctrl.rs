@@ -866,6 +866,25 @@ impl VhostUserHandle {
     }
 }
 
+pub struct VhostUserBackend {
+    pub(super) vu: VhostUserHandle,
+    pub(super) cfg: VhostUserConfig,
+}
+
+impl VhostUserBackend {
+    pub fn connect(cfg: VhostUserConfig, kill_evt: &EventFd) -> Result<Self> {
+        VhostUserHandle::connect_vhost_user(
+            cfg.server,
+            &cfg.socket,
+            cfg.num_queues as u64,
+            false,
+            kill_evt,
+            |_| Ok(()),
+        )
+        .map(|vu| Self { vu, cfg })
+    }
+}
+
 fn memfd_create(name: &ffi::CStr, flags: u32) -> io::Result<RawFd> {
     // SAFETY: FFI call with valid arguments
     let res = unsafe { libc::syscall(libc::SYS_memfd_create, name.as_ptr(), flags) };

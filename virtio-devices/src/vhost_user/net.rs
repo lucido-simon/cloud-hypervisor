@@ -30,8 +30,9 @@ use vmm_sys_util::timerfd::TimerFd;
 use crate::device::ActivationContext;
 use crate::net::{AnnounceOps, AnnouncementState, Announcer, VirtioNetGuestAnnounceOps};
 use crate::seccomp_filters::Thread;
-use crate::vhost_user::vu_common_ctrl::{VhostUserConfig, VhostUserHandle};
-use crate::vhost_user::{DEFAULT_VIRTIO_FEATURES, Error, Result, VhostUserCommon, VhostUserState};
+use crate::vhost_user::{
+    DEFAULT_VIRTIO_FEATURES, Error, Result, VhostUserBackend, VhostUserCommon, VhostUserState,
+};
 use crate::{
     ActivateError, ActivateResult, GuestRegionMmap, NetCtrlEpollHandler, VIRTIO_F_ACCESS_PLATFORM,
     VirtioCommon, VirtioDevice, VirtioDeviceType,
@@ -78,9 +79,9 @@ impl Net {
     #[expect(clippy::too_many_arguments)]
     pub fn new(
         id: String,
+        backend: VhostUserBackend,
         mac_addr: &mut Option<MacAddr>,
         mtu: Option<u16>,
-        vu_cfg: VhostUserConfig,
         queue_size: u16,
         seccomp_action: SeccompAction,
         exit_evt: EventFd,
@@ -90,16 +91,8 @@ impl Net {
         offload_ufo: bool,
         offload_csum: bool,
     ) -> Result<Net> {
-        let mut num_queues = vu_cfg.num_queues;
-
-        let mut vu = VhostUserHandle::connect_vhost_user(
-            vu_cfg.server,
-            &vu_cfg.socket,
-            num_queues as u64,
-            false,
-            &exit_evt,
-            |_| Ok(()),
-        )?;
+        let mut num_queues = backend.cfg.num_queues;
+        let mut vu = backend.vu;
 
         let (
             avail_features,
@@ -278,9 +271,9 @@ impl Net {
                 },
                 vu: Some(Arc::new(Mutex::new(vu))),
                 acked_protocol_features,
-                socket_path: vu_cfg.socket,
+                socket_path: backend.cfg.socket,
                 vu_num_queues,
-                server: vu_cfg.server,
+                server: backend.cfg.server,
                 vring_bases,
                 ..Default::default()
             },

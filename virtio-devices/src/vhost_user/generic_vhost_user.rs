@@ -18,11 +18,10 @@ use vm_migration::protocol::MemoryRangeTable;
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 use vmm_sys_util::eventfd::EventFd;
 
-use super::vu_common_ctrl::{VhostUserConfig, VhostUserHandle};
 use super::{Error, Result};
 use crate::device::ActivationContext;
 use crate::seccomp_filters::Thread;
-use crate::vhost_user::{VhostUserCommon, VhostUserState};
+use crate::vhost_user::{VhostUserBackend, VhostUserCommon, VhostUserState};
 use crate::{
     ActivateResult, GuestRegionMmap, MmapRegion, VIRTIO_F_ACCESS_PLATFORM, VirtioCommon,
     VirtioDevice, VirtioInterrupt, VirtioInterruptType, VirtioSharedMemoryList,
@@ -63,7 +62,7 @@ impl GenericVhostUser {
     #[expect(clippy::too_many_arguments)]
     pub fn new(
         id: String,
-        vu_cfg: VhostUserConfig,
+        backend: VhostUserBackend,
         request_queue_sizes: Vec<u16>,
         device_type: u32,
         cache: Option<(VirtioSharedMemoryList, MmapRegion)>,
@@ -74,16 +73,7 @@ impl GenericVhostUser {
     ) -> Result<GenericVhostUser> {
         // Calculate the actual number of queues needed.
         let num_queues = request_queue_sizes.len();
-
-        // Connect to the vhost-user socket.
-        let mut vu = VhostUserHandle::connect_vhost_user(
-            false,
-            &vu_cfg.socket,
-            num_queues as u64,
-            false,
-            &exit_evt,
-            |_| Ok(()),
-        )?;
+        let mut vu = backend.vu;
 
         let (
             avail_features,
@@ -169,7 +159,7 @@ since the backend only supports {backend_num_queues}\n",
                 },
                 vu: Some(Arc::new(Mutex::new(vu))),
                 acked_protocol_features,
-                socket_path: vu_cfg.socket,
+                socket_path: backend.cfg.socket,
                 vu_num_queues,
                 vring_bases,
                 ..Default::default()

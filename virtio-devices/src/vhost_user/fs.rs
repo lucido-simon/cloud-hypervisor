@@ -18,11 +18,10 @@ use vm_migration::protocol::MemoryRangeTable;
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 use vmm_sys_util::eventfd::EventFd;
 
-use super::vu_common_ctrl::{VhostUserConfig, VhostUserHandle};
 use super::{DEFAULT_VIRTIO_FEATURES, Error, Result};
 use crate::device::ActivationContext;
 use crate::seccomp_filters::Thread;
-use crate::vhost_user::{VhostUserCommon, VhostUserState};
+use crate::vhost_user::{VhostUserBackend, VhostUserCommon, VhostUserState};
 use crate::{
     ActivateResult, GuestRegionMmap, MmapRegion, VIRTIO_F_ACCESS_PLATFORM, VirtioCommon,
     VirtioDevice, VirtioDeviceType, VirtioSharedMemoryList,
@@ -75,7 +74,7 @@ impl Fs {
     #[expect(clippy::too_many_arguments)]
     pub fn new(
         id: String,
-        vu_cfg: VhostUserConfig,
+        backend: VhostUserBackend,
         tag: &str,
         queue_size: u16,
         cache: Option<(VirtioSharedMemoryList, MmapRegion)>,
@@ -84,17 +83,8 @@ impl Fs {
         access_platform_enabled: bool,
         state: Option<State>,
     ) -> Result<Fs> {
-        let num_queues = vu_cfg.num_queues;
-
-        // Connect to the vhost-user socket.
-        let mut vu = VhostUserHandle::connect_vhost_user(
-            false,
-            &vu_cfg.socket,
-            num_queues as u64,
-            false,
-            &exit_evt,
-            |_| Ok(()),
-        )?;
+        let num_queues = backend.cfg.num_queues;
+        let mut vu = backend.vu;
 
         let (
             avail_features,
@@ -194,7 +184,7 @@ impl Fs {
                 },
                 vu: Some(Arc::new(Mutex::new(vu))),
                 acked_protocol_features,
-                socket_path: vu_cfg.socket,
+                socket_path: backend.cfg.socket,
                 vu_num_queues,
                 vring_bases,
                 ..Default::default()
