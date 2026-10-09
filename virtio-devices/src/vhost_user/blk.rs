@@ -95,6 +95,7 @@ impl Blk {
     pub fn new(
         id: String,
         vu_cfg: VhostUserConfig,
+        queue_size: u16,
         seccomp_action: SeccompAction,
         exit_evt: EventFd,
         access_platform_enabled: bool,
@@ -205,7 +206,7 @@ impl Blk {
             vu_common: VhostUserCommon {
                 virtio_common: VirtioCommon {
                     device_type: VirtioDeviceType::Block as u32,
-                    queue_sizes: vec![vu_cfg.queue_size; num_queues],
+                    queue_sizes: vec![queue_size; num_queues],
                     avail_features,
                     acked_features,
                     paused_sync: Some(Arc::new(Barrier::new(2))),

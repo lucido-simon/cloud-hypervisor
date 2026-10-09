@@ -81,7 +81,7 @@ impl Net {
         mac_addr: &mut Option<MacAddr>,
         mtu: Option<u16>,
         vu_cfg: VhostUserConfig,
-        server: bool,
+        queue_size: u16,
         seccomp_action: SeccompAction,
         exit_evt: EventFd,
         access_platform_enabled: bool,
@@ -93,7 +93,7 @@ impl Net {
         let mut num_queues = vu_cfg.num_queues;
 
         let mut vu = VhostUserHandle::connect_vhost_user(
-            server,
+            vu_cfg.server,
             &vu_cfg.socket,
             num_queues as u64,
             false,
@@ -268,7 +268,7 @@ impl Net {
             vu_common: VhostUserCommon {
                 virtio_common: VirtioCommon {
                     device_type: VirtioDeviceType::Net as u32,
-                    queue_sizes: vec![vu_cfg.queue_size; num_queues],
+                    queue_sizes: vec![queue_size; num_queues],
                     avail_features,
                     acked_features,
                     paused_sync: Some(Arc::new(Barrier::new(2))),
@@ -280,7 +280,7 @@ impl Net {
                 acked_protocol_features,
                 socket_path: vu_cfg.socket,
                 vu_num_queues,
-                server,
+                server: vu_cfg.server,
                 vring_bases,
                 ..Default::default()
             },

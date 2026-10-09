@@ -2736,12 +2736,13 @@ impl DeviceManager {
             let vu_cfg = VhostUserConfig {
                 socket,
                 num_queues: disk_cfg.num_queues,
-                queue_size: disk_cfg.queue_size,
+                server: false,
             };
             let vhost_user_block = Arc::new(Mutex::new(
                 match vhost_user::Blk::new(
                     id.clone(),
                     vu_cfg,
+                    disk_cfg.queue_size,
                     self.seccomp_action.clone(),
                     self.exit_evt
                         .try_clone()
@@ -2931,14 +2932,14 @@ impl DeviceManager {
 
         let (virtio_device, migratable_device) = if net_cfg.vhost_user {
             let socket = net_cfg.vhost_socket.as_ref().unwrap().clone();
-            let vu_cfg = VhostUserConfig {
-                socket,
-                num_queues: net_cfg.num_queues,
-                queue_size: net_cfg.queue_size,
-            };
             let server = match net_cfg.vhost_mode {
                 VhostMode::Client => false,
                 VhostMode::Server => true,
+            };
+            let vu_cfg = VhostUserConfig {
+                socket,
+                num_queues: net_cfg.num_queues,
+                server,
             };
             let vhost_user_net = Arc::new(Mutex::new(
                 match vhost_user::Net::new(
@@ -2946,7 +2947,7 @@ impl DeviceManager {
                     &mut net_cfg.mac,
                     net_cfg.mtu,
                     vu_cfg,
-                    server,
+                    net_cfg.queue_size,
                     self.seccomp_action.clone(),
                     self.exit_evt
                         .try_clone()
