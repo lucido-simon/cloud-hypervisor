@@ -18,7 +18,7 @@ use vm_migration::protocol::MemoryRangeTable;
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 use vmm_sys_util::eventfd::EventFd;
 
-use super::vu_common_ctrl::VhostUserHandle;
+use super::vu_common_ctrl::{VhostUserConfig, VhostUserHandle};
 use super::{Error, Result};
 use crate::device::ActivationContext;
 use crate::seccomp_filters::Thread;
@@ -63,7 +63,7 @@ impl GenericVhostUser {
     #[expect(clippy::too_many_arguments)]
     pub fn new(
         id: String,
-        path: &str,
+        vu_cfg: VhostUserConfig,
         request_queue_sizes: Vec<u16>,
         device_type: u32,
         cache: Option<(VirtioSharedMemoryList, MmapRegion)>,
@@ -78,7 +78,7 @@ impl GenericVhostUser {
         // Connect to the vhost-user socket.
         let mut vu = VhostUserHandle::connect_vhost_user(
             false,
-            path,
+            &vu_cfg.socket,
             num_queues as u64,
             false,
             &exit_evt,
@@ -169,7 +169,7 @@ since the backend only supports {backend_num_queues}\n",
                 },
                 vu: Some(Arc::new(Mutex::new(vu))),
                 acked_protocol_features,
-                socket_path: path.to_string(),
+                socket_path: vu_cfg.socket,
                 vu_num_queues,
                 vring_bases,
                 ..Default::default()

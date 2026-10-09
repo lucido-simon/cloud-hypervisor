@@ -18,7 +18,7 @@ use vm_migration::protocol::MemoryRangeTable;
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 use vmm_sys_util::eventfd::EventFd;
 
-use super::vu_common_ctrl::VhostUserHandle;
+use super::vu_common_ctrl::{VhostUserConfig, VhostUserHandle};
 use super::{DEFAULT_VIRTIO_FEATURES, Error, Result};
 use crate::device::ActivationContext;
 use crate::seccomp_filters::Thread;
@@ -28,7 +28,7 @@ use crate::{
     VirtioDevice, VirtioDeviceType, VirtioSharedMemoryList,
 };
 
-const NUM_QUEUE_OFFSET: usize = 1;
+pub const NUM_QUEUE_OFFSET: usize = 1;
 const DEFAULT_QUEUE_NUMBER: usize = 2;
 
 pub type State = VhostUserState<VirtioFsConfig>;
@@ -75,9 +75,8 @@ impl Fs {
     #[expect(clippy::too_many_arguments)]
     pub fn new(
         id: String,
-        path: &str,
+        vu_cfg: VhostUserConfig,
         tag: &str,
-        req_num_queues: usize,
         queue_size: u16,
         cache: Option<(VirtioSharedMemoryList, MmapRegion)>,
         seccomp_action: SeccompAction,
@@ -85,13 +84,12 @@ impl Fs {
         access_platform_enabled: bool,
         state: Option<State>,
     ) -> Result<Fs> {
-        // Calculate the actual number of queues needed.
-        let num_queues = NUM_QUEUE_OFFSET + req_num_queues;
+        let num_queues = vu_cfg.num_queues;
 
         // Connect to the vhost-user socket.
         let mut vu = VhostUserHandle::connect_vhost_user(
             false,
-            path,
+            &vu_cfg.socket,
             num_queues as u64,
             false,
             &exit_evt,
@@ -164,7 +162,8 @@ impl Fs {
                 config.tag.len()
             };
             config.tag[..len].copy_from_slice(tag_bytes_slice[..len].as_ref());
-            config.num_request_queues = req_num_queues as u32;
+            // num_queues includes the hiprio queue, which isn't a request queue.
+            config.num_request_queues = (num_queues - NUM_QUEUE_OFFSET) as u32;
 
             (
                 acked_features,
@@ -195,7 +194,7 @@ impl Fs {
                 },
                 vu: Some(Arc::new(Mutex::new(vu))),
                 acked_protocol_features,
-                socket_path: path.to_string(),
+                socket_path: vu_cfg.socket,
                 vu_num_queues,
                 vring_bases,
                 ..Default::default()

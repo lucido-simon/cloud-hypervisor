@@ -3202,10 +3202,15 @@ impl DeviceManager {
         let mut node = device_node!(id);
 
         if let Some(generic_vhost_user_socket) = generic_vhost_user_cfg.socket.to_str() {
+            let vu_cfg = VhostUserConfig {
+                socket: generic_vhost_user_socket.to_string(),
+                num_queues: generic_vhost_user_cfg.queue_sizes.len(),
+                server: false,
+            };
             let generic_vhost_user_device = Arc::new(Mutex::new(
                 vhost_user::GenericVhostUser::new(
                     id.clone(),
-                    generic_vhost_user_socket,
+                    vu_cfg,
                     generic_vhost_user_cfg.queue_sizes.clone(),
                     generic_vhost_user_cfg.device_type,
                     None,
@@ -3272,12 +3277,16 @@ impl DeviceManager {
         let mut node = device_node!(id);
 
         if let Some(fs_socket) = fs_cfg.socket.to_str() {
+            let vu_cfg = VhostUserConfig {
+                socket: fs_socket.to_string(),
+                num_queues: vhost_user::fs::NUM_QUEUE_OFFSET + fs_cfg.num_queues,
+                server: false,
+            };
             let virtio_fs_device = Arc::new(Mutex::new(
                 vhost_user::Fs::new(
                     id.clone(),
-                    fs_socket,
+                    vu_cfg,
                     &fs_cfg.tag,
-                    fs_cfg.num_queues,
                     fs_cfg.queue_size,
                     None,
                     self.seccomp_action.clone(),
