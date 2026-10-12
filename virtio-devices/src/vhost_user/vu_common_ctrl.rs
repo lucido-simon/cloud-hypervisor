@@ -883,6 +883,22 @@ impl VhostUserBackend {
         )
         .map(|vu| Self { vu, cfg })
     }
+
+    pub fn supports_protocol_features(
+        &mut self,
+        features: VhostUserProtocolFeatures,
+    ) -> Result<bool> {
+        if self.vu.backend_features & VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits() == 0 {
+            return Ok(false);
+        }
+
+        let backend_protocol_features = self
+            .vu
+            .vu
+            .get_protocol_features()
+            .map_err(Error::VhostUserGetProtocolFeatures)?;
+        Ok(backend_protocol_features.contains(features))
+    }
 }
 
 fn memfd_create(name: &ffi::CStr, flags: u32) -> io::Result<RawFd> {

@@ -112,6 +112,7 @@ use tracer::trace_scoped;
 #[cfg(feature = "kvm")]
 use vfio_ioctls::VfioIommufd;
 use vfio_ioctls::{VfioContainer, VfioDevice, VfioDeviceFd, VfioOps};
+use vhost::vhost_user::message::VhostUserProtocolFeatures;
 use virtio_devices::block::Error as VirtioBlockError;
 use virtio_devices::transport::{
     VIRTIO_CONFIG_BAR_INDEX, VIRTIO_SHM_BAR_INDEX, VirtioPciDevice, VirtioPciDeviceActivator,
@@ -262,6 +263,16 @@ pub enum DeviceManagerError {
     /// Cannot create vhost-user-blk device
     #[error("Cannot create vhost-user-blk device")]
     CreateVhostUserBlk(#[source] vhost_user::Error),
+
+    /// Cannot query the protocol features of a vhost-user backend
+    #[error("Cannot query the protocol features of the vhost-user backend of device {0}")]
+    VhostUserGetProtocolFeatures(String, #[source] vhost_user::Error),
+
+    /// A vhost-user backend doesn't support the pagefault feature
+    #[error(
+        "The vhost-user backend of device {0} does not support PAGEFAULT, which postcopy migration and on-demand restore require"
+    )]
+    VhostUserPageFaultUnsupported(String),
 
     /// Cannot create virtio-pmem device
     #[error("Cannot create virtio-pmem device")]
@@ -1446,6 +1457,23 @@ impl DeviceManager {
             .map_err(DeviceManagerError::BusError)?;
 
         Ok(device_manager)
+    }
+
+    fn check_vhost_user_postcopy_feature(
+        &self,
+        id: &str,
+        vu: &mut VhostUserBackend,
+    ) -> DeviceManagerResult<()> {
+        let supported = vu
+            .supports_protocol_features(VhostUserProtocolFeatures::PAGEFAULT)
+            .map_err(|e| DeviceManagerError::VhostUserGetProtocolFeatures(id.to_string(), e))?;
+        if !supported {
+            return Err(DeviceManagerError::VhostUserPageFaultUnsupported(
+                id.to_string(),
+            ));
+        }
+
+        Ok(())
     }
 
     pub fn console_resize_pipe(&self) -> Option<Arc<File>> {
@@ -2738,8 +2766,11 @@ impl DeviceManager {
                 num_queues: disk_cfg.num_queues,
                 server: false,
             };
-            let vu = VhostUserBackend::connect(vu_cfg, &self.exit_evt)
+            let mut vu = VhostUserBackend::connect(vu_cfg, &self.exit_evt)
                 .map_err(DeviceManagerError::CreateVhostUserBlk)?;
+            if self.memory_manager.lock().unwrap().restoring() {
+                self.check_vhost_user_postcopy_feature(&id, &mut vu)?;
+            }
             let vhost_user_block = Arc::new(Mutex::new(
                 match vhost_user::Blk::new(
                     id.clone(),
@@ -2943,8 +2974,11 @@ impl DeviceManager {
                 num_queues: net_cfg.num_queues,
                 server,
             };
-            let vu = VhostUserBackend::connect(vu_cfg, &self.exit_evt)
+            let mut vu = VhostUserBackend::connect(vu_cfg, &self.exit_evt)
                 .map_err(DeviceManagerError::CreateVhostUserNet)?;
+            if self.memory_manager.lock().unwrap().restoring() {
+                self.check_vhost_user_postcopy_feature(&id, &mut vu)?;
+            }
             let vhost_user_net = Arc::new(Mutex::new(
                 match vhost_user::Net::new(
                     id.clone(),
@@ -3211,8 +3245,11 @@ impl DeviceManager {
                 num_queues: generic_vhost_user_cfg.queue_sizes.len(),
                 server: false,
             };
-            let vu = VhostUserBackend::connect(vu_cfg, &self.exit_evt)
+            let mut vu = VhostUserBackend::connect(vu_cfg, &self.exit_evt)
                 .map_err(DeviceManagerError::CreateGenericVhostUser)?;
+            if self.memory_manager.lock().unwrap().restoring() {
+                self.check_vhost_user_postcopy_feature(&id, &mut vu)?;
+            }
             let generic_vhost_user_device = Arc::new(Mutex::new(
                 vhost_user::GenericVhostUser::new(
                     id.clone(),
@@ -3288,8 +3325,11 @@ impl DeviceManager {
                 num_queues: vhost_user::fs::NUM_QUEUE_OFFSET + fs_cfg.num_queues,
                 server: false,
             };
-            let vu = VhostUserBackend::connect(vu_cfg, &self.exit_evt)
+            let mut vu = VhostUserBackend::connect(vu_cfg, &self.exit_evt)
                 .map_err(DeviceManagerError::CreateVirtioFs)?;
+            if self.memory_manager.lock().unwrap().restoring() {
+                self.check_vhost_user_postcopy_feature(&id, &mut vu)?;
+            }
             let virtio_fs_device = Arc::new(Mutex::new(
                 vhost_user::Fs::new(
                     id.clone(),
