@@ -1415,12 +1415,29 @@ impl MemoryManager {
                 .find_map(|zone| zone.backing_page_size_for_gpa(range.gpa))
                 .unwrap_or(base_page_size);
 
-            handler_ranges.push(UffdRange {
-                host_addr,
-                length: range.length,
-                source_offset: source_offset_for(range),
-                page_size: range_page_size,
-            });
+            // PoC: resolve faults in 2 MiB chunks. Split the range into a
+            // 4 KiB head, a 2 MiB-aligned middle and a 4 KiB tail.
+            const CHUNK: u64 = 2 << 20;
+            let source_offset = source_offset_for(range);
+            let end = host_addr + range.length;
+            let mid_start = host_addr.next_multiple_of(CHUNK).min(end);
+            let mid_end = align_down(end, CHUNK).max(mid_start);
+            let chunk_page_size = range_page_size.max(CHUNK);
+            for (start, stop, page_size) in [
+                (host_addr, mid_start, range_page_size),
+                (mid_start, mid_end, chunk_page_size),
+                (mid_end, end, range_page_size),
+            ] {
+                if start == stop {
+                    continue;
+                }
+                handler_ranges.push(UffdRange {
+                    host_addr: start,
+                    length: stop - start,
+                    source_offset: source_offset + (start - host_addr),
+                    page_size,
+                });
+            }
         }
 
         Ok(Some(
@@ -1650,6 +1667,24 @@ impl MemoryManager {
 
         let mut prefault_active = background_fetch_pages && !ranges.is_empty();
         let mut source_failed = false;
+        let bench_start = std::time::Instant::now();
+        let mut bench_faults: u64 = 0;
+        let mut bench_fault_bytes: u64 = 0;
+        let mut bench_resolve_ns: u128 = 0;
+        let mut bench_max_resolve_ns: u128 = 0;
+        macro_rules! bench_log {
+            ($why:expr) => {
+                info!(
+                    "BENCH uffd.handler exit={} elapsed_ms={} demand_faults={} demand_bytes={} resolve_ms={} max_resolve_ms={:.3} chunk=2MiB",
+                    $why,
+                    bench_start.elapsed().as_millis(),
+                    bench_faults,
+                    bench_fault_bytes,
+                    bench_resolve_ns / 1_000_000,
+                    bench_max_resolve_ns as f64 / 1e6
+                )
+            };
+        }
 
         const EVENT_STOP: u64 = u64::MAX;
         const EVENT_ADDED_UFFD: u64 = u64::MAX - 1;
@@ -1695,6 +1730,7 @@ impl MemoryManager {
             if pages.remaining.load(Ordering::Relaxed) == 0 {
                 uffd_registry.stop()?;
                 info!("UFFD handler: all pages served, exiting");
+                bench_log!("all_served");
                 return Ok(());
             }
 
@@ -1715,6 +1751,7 @@ impl MemoryManager {
                 .any(|event| event.data == EVENT_STOP)
             {
                 info!("UFFD handler: received stop event, exiting");
+                bench_log!("stop");
                 return Ok(());
             }
 
@@ -1902,7 +1939,16 @@ impl MemoryManager {
                     continue;
                 }
 
+                let bench_t = std::time::Instant::now();
                 let result = source.resolve(fault_uffd.fd(), range, page_idx);
+                let bench_ns = bench_t.elapsed().as_nanos();
+                bench_faults += 1;
+                bench_fault_bytes += range.page_size;
+                bench_resolve_ns += bench_ns;
+                bench_max_resolve_ns = bench_max_resolve_ns.max(bench_ns);
+                if bench_faults.is_power_of_two() {
+                    bench_log!("progress");
+                }
 
                 {
                     let mut loading = pages.loading.lock().unwrap();
